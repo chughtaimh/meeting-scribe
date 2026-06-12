@@ -1,0 +1,35 @@
+# ── Private app data: API key (config.json), search DB, logs, voice profiles ──
+MeetingScribe/data/
+
+# ── Meeting content: recordings, transcripts, notes ──
+/Transcripts/
+/Transcript Cleanup Demo/
+
+# Belt and braces: never commit audio or per-recording transcript files,
+# wherever they end up (e.g. if the transcripts folder is moved inside the repo)
+*.webm
+*.wav
+*.m4a
+*.mp3
+*.ogg
+*.oga
+*.opus
+*.flac
+*.mov
+*.mp4
+transcript.md
+transcript.json
+
+# Credentials / local state — anywhere in the tree
+config.json
+*.db
+*.log
+
+# ── Python ──
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# ── macOS noise ──
+.DS_Store

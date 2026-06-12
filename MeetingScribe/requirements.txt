@@ -1,0 +1,4 @@
+flask>=2.2,<4
+requests>=2.28
+numpy>=1.23
+imageio-ffmpeg>=0.4.8
