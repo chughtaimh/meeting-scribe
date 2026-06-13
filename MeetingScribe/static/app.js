@@ -66,6 +66,54 @@ function speakerColor(label, order) {
   return SPEAKER_COLORS[i % SPEAKER_COLORS.length];
 }
 
+// Group speaker labels by their DISPLAY name. A person who was split across
+// several labels (over-segmentation) and renamed to one name shows as ONE chip
+// instead of several; each still-unidentified "Speaker X" label keeps its own
+// group. Named people come first, then the unidentified labels; first-seen
+// order is preserved within each. Nothing is dropped — every label lands in a
+// group and stays renameable.
+function legendGroups(speakers, order) {
+  const byDisplay = new Map(), groups = [];
+  for (const lab of order) {
+    const display = speakers[lab] || ("Speaker " + lab);
+    const named = !!display && !display.toLowerCase().startsWith("speaker");
+    const g = byDisplay.get(display);
+    if (g) { g.labels.push(lab); continue; }
+    const ng = { display, labels: [lab], named };
+    byDisplay.set(display, ng);
+    groups.push(ng);
+  }
+  const named = groups.filter(g => g.named);
+  const unnamed = groups.filter(g => !g.named);
+  return { named, unnamed };
+}
+
+// Honest header tally: distinct named people plus the count of still
+// unidentified voices — never the raw label count (which double-counts a
+// person spread across labels and inflates phantom over-segmentation).
+function speakerCountText(namedCount, unnamedCount) {
+  const s = n => (n === 1 ? "" : "s");
+  if (namedCount && unnamedCount)
+    return `${namedCount} speaker${s(namedCount)} + ${unnamedCount} unidentified`;
+  if (namedCount) return `${namedCount} speaker${s(namedCount)}`;
+  return `${unnamedCount} unidentified speaker${s(unnamedCount)}`;
+}
+
+// One legend chip per group. A merged group (>1 label) carries every underlying
+// label in data-labels so a rename updates them all at once, and gets a small
+// "split" badge to separate them again if the merge was wrong.
+function legendChipHtml(group, order) {
+  const labelsAttr = esc(JSON.stringify(group.labels));
+  const color = speakerColor(group.labels[0], order);
+  const merged = group.labels.length > 1;
+  return `<span class="chip" title="Click the name to rename">
+      <span class="swatch" style="background:${color}"></span>
+      <input data-labels="${labelsAttr}" value="${esc(group.display)}" spellcheck="false">
+      ${merged ? `<button class="splitbtn" type="button" data-labels="${labelsAttr}"
+        title="${group.labels.length} voice segments merged under one name — click to edit each separately">${group.labels.length}</button>` : ""}
+    </span>`;
+}
+
 const I = {
   mic: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="11" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><line x1="12" y1="17" x2="12" y2="21"/></svg>',
   users: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
@@ -664,13 +712,22 @@ async function viewTranscript(recId, params) {
       </div>` : ""}
     </div>` : "";
 
-  const legend = isMeeting && order.length ? `
-    <div class="legend">${order.map(lab => `
-      <span class="chip" title="Click to rename">
-        <span class="swatch" style="background:${speakerColor(lab, order)}"></span>
-        <input data-label="${esc(lab)}" value="${esc(speakers[lab] || ("Speaker " + lab))}">
-      </span>`).join("")}
+  // Legend: dedupe a person split across labels into one chip, list named
+  // people before unidentified "Speaker X" labels, and fold a large unidentified
+  // group behind a one-click expander. Every label stays present and renameable.
+  const COLLAPSE_UNNAMED_AFTER = 4;
+  const lg = isMeeting ? legendGroups(speakers, order) : { named: [], unnamed: [] };
+  const collapseUnnamed = lg.unnamed.length > COLLAPSE_UNNAMED_AFTER;
+  const namedChips = lg.named.map(g => legendChipHtml(g, order)).join("");
+  const unnamedChips = lg.unnamed.map(g => legendChipHtml(g, order)).join("");
+  const legend = isMeeting && (lg.named.length || lg.unnamed.length) ? `
+    <div class="legend">
+      ${namedChips}${collapseUnnamed ? "" : unnamedChips}
       <span class="muted small" style="align-self:center">· click a name to edit</span>
+      ${collapseUnnamed ? `<details class="morespk">
+        <summary>Show ${lg.unnamed.length} unidentified speaker${lg.unnamed.length === 1 ? "" : "s"}</summary>
+        <div class="legend-more">${unnamedChips}</div>
+      </details>` : ""}
     </div>` : "";
 
   const turnsHtml = turns.map(t => {
@@ -694,7 +751,7 @@ async function viewTranscript(recId, params) {
         <h1 contenteditable="true" id="rec-title" spellcheck="false">${esc(rec.title || "Untitled")}</h1>
       </div>
       <div class="meta">${esc(fmtDate(rec.created_at))} · ${esc(fmtClock(rec.duration_s))}
-        · ${isMeeting ? `Meeting · ${order.length} speaker${order.length === 1 ? "" : "s"}` : "Voice note"}</div>
+        · ${isMeeting ? `Meeting · ${esc(speakerCountText(lg.named.length, lg.unnamed.length))}` : "Voice note"}</div>
       <div class="actions">
         <button class="btn" id="btn-copy-all">${I.copy} Copy transcript</button>
         <a class="btn" href="/api/recordings/${esc(recId)}/file/md">${I.download} Markdown</a>
@@ -772,23 +829,51 @@ async function viewTranscript(recId, params) {
   $title.addEventListener("blur", saveTitle);
   $title.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $title.blur(); } });
 
-  // speaker renaming
+  // speaker renaming. Each input carries ALL labels that share its display name
+  // (data-labels), so editing a merged person renames every underlying label at
+  // once; collapsed/unidentified inputs stay in the DOM and are sent too.
   let renameTimer = null;
-  document.querySelectorAll(".legend input").forEach(inp => {
-    inp.addEventListener("change", () => {
-      clearTimeout(renameTimer);
-      renameTimer = setTimeout(async () => {
-        const mapping = {};
-        document.querySelectorAll(".legend input").forEach(i2 => { mapping[i2.dataset.label] = i2.value.trim(); });
-        try {
-          await api(`/api/recordings/${recId}/speakers`, {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ speakers: mapping }),
-          });
-          toast("Speakers updated");
-          viewTranscript(recId, params);   // re-render with new names
-        } catch (e) { toast(e.message, true); }
-      }, 250);
+  const labelsOf = (el) => { try { return JSON.parse(el.dataset.labels || "[]"); } catch (e) { return []; } };
+  const onRenameChange = () => {
+    clearTimeout(renameTimer);
+    renameTimer = setTimeout(async () => {
+      const mapping = {};
+      document.querySelectorAll(".legend input").forEach(i2 => {
+        const v = i2.value.trim();
+        labelsOf(i2).forEach(l => { mapping[l] = v; });
+      });
+      try {
+        await api(`/api/recordings/${recId}/speakers`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ speakers: mapping }),
+        });
+        toast("Speakers updated");
+        viewTranscript(recId, params);   // re-render with new names
+      } catch (e) { toast(e.message, true); }
+    }, 250);
+  };
+  const bindLegendInputs = () => {
+    document.querySelectorAll(".legend input").forEach(inp => {
+      if (inp.dataset.bound) return;
+      inp.dataset.bound = "1";
+      inp.addEventListener("change", onRenameChange);
+    });
+  };
+  bindLegendInputs();
+
+  // "Split" a merged person back into its individual labels for separate
+  // editing (undo a wrong merge). Purely expands the chip in place; renaming
+  // any of the split labels to a new name is what actually separates them.
+  document.querySelectorAll(".legend .splitbtn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const labs = labelsOf(btn);
+      const chip = btn.closest(".chip");
+      if (!chip || labs.length < 2) return;
+      const html = labs.map(l => legendChipHtml(
+        { display: speakers[l] || ("Speaker " + l), labels: [l], named: false }, order)).join("");
+      chip.insertAdjacentHTML("afterend", html);
+      chip.remove();
+      bindLegendInputs();
     });
   });
 

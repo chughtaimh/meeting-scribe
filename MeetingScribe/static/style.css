@@ -191,7 +191,21 @@ input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-so
   font-size: 13px; font-weight: 600; cursor: pointer;
 }
 .chip .swatch { width: 10px; height: 10px; border-radius: 50%; }
-.chip input { border: none; outline: none; font: inherit; width: 110px; padding: 0; }
+.chip input { border: none; outline: none; font: inherit; width: 110px; padding: 0; background: transparent; }
+.chip .splitbtn {
+  border: none; padding: 0; width: 18px; height: 18px; border-radius: 50%;
+  background: var(--bg); color: var(--ink-3); font-size: 11px; font-weight: 700;
+  line-height: 1; flex: 0 0 18px;
+}
+.chip .splitbtn:hover { background: #e2e5ec; color: var(--ink); }
+
+/* Folded "unidentified speakers" group inside the legend. */
+.morespk { flex-basis: 100%; margin-top: 2px; }
+.morespk > summary {
+  cursor: pointer; font-size: 13px; font-weight: 600; color: var(--ink-2); outline: none;
+}
+.morespk > summary:hover { color: var(--ink); }
+.legend-more { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
 
 .turns { margin-top: 10px; }
 .turn { display: flex; gap: 14px; padding: 13px 16px; border-radius: 12px; }
