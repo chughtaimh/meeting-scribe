@@ -213,6 +213,12 @@ input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-so
 .set-row .desc { color: var(--ink-2); font-size: 13.5px; margin-bottom: 12px; }
 .inline { display: flex; gap: 10px; align-items: center; }
 .inline input { flex: 1; }
+.set-row select {
+  width: 100%; padding: 10px 14px; border: 1px solid var(--line);
+  border-radius: 10px; font: inherit; background: #fff; color: var(--ink);
+  outline: none;
+}
+.set-row select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 .testmsg { margin-top: 10px; font-size: 13.5px; }
 .testmsg.ok { color: var(--ok); }
 .testmsg.bad { color: var(--danger); }

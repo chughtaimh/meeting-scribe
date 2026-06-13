@@ -873,6 +873,16 @@ async function viewLibrary(params) {
 async function viewSettings() {
   setNav("settings");
   const st = await refreshState() || {};
+  let profiles = [];
+  try { profiles = (await api("/api/profiles")).profiles || []; } catch (e) {}
+  const selfPicker = profiles.length ? `
+        <div class="inline" style="margin-top:12px">
+          <select id="set-self-name">
+            <option value=""${st.self_profile_name ? "" : " selected"}>Not set</option>
+            ${profiles.map(n => `<option value="${esc(n)}"${n === st.self_profile_name ? " selected" : ""}>${esc(n)}</option>`).join("")}
+          </select>
+        </div>`
+    : `<div class="desc" style="margin:12px 0 0">Record a meeting and rename a speaker to your name to create your voice profile, then choose it here.</div>`;
   $view.innerHTML = `
     <h1>Settings</h1>
     <p class="sub">Everything stays on your Mac except the audio sent to OpenAI for transcription.</p>
@@ -904,6 +914,16 @@ async function viewSettings() {
           </div>
           <label class="switch"><input type="checkbox" id="set-summaries" ${st.generate_summaries ? "checked" : ""}><span></span></label>
         </div>
+      </div>
+      <div class="set-row">
+        <div class="inline" style="justify-content:space-between">
+          <div>
+            <div class="lab">Identify me automatically</div>
+            <div class="desc" style="margin:0">Send your own saved voice profile with every meeting so you’re labelled by name from the start. Everyone else stays “Speaker A/B” until you rename them.</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="set-self-enabled" ${st.self_profile_enabled ? "checked" : ""}><span></span></label>
+        </div>
+        ${selfPicker}
       </div>
       <div class="set-row">
         <div class="lab">Usage this month</div>
@@ -964,6 +984,21 @@ async function viewSettings() {
     try {
       await api("/api/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ generate_summaries: e.target.checked }) });
       toast(e.target.checked ? "Summaries on" : "Summaries off");
+    } catch (err) { toast(err.message, true); }
+  });
+
+  document.getElementById("set-self-enabled").addEventListener("change", async (e) => {
+    try {
+      await api("/api/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ self_profile_enabled: e.target.checked }) });
+      toast(e.target.checked ? "Auto-identify on" : "Auto-identify off");
+    } catch (err) { toast(err.message, true); }
+  });
+
+  const $selfName = document.getElementById("set-self-name");
+  if ($selfName) $selfName.addEventListener("change", async (e) => {
+    try {
+      await api("/api/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ self_profile_name: e.target.value }) });
+      toast(e.target.value ? "That’s you — " + e.target.value : "Selection cleared");
     } catch (err) { toast(err.message, true); }
   });
 

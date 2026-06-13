@@ -1,16 +1,20 @@
 """Persistent voice profiles.
 
 A profile is a short reference clip of a known person's voice, stored in
-MeetingScribe/data/voices/<Name>.wav. Profiles are passed to the diarization
-model from the FIRST audio part of every meeting, which anchors speaker
-clusters to known voices — this is the main defence against phantom speakers
-(e.g. background voices at a remote participant's location being assigned
-"Speaker C"/"Speaker D", or a real participant splitting into a new label).
+MeetingScribe/data/voices/<Name>.wav. The user picks ONE of these in Settings
+as "this is me"; when enabled, that single profile is sent to the diarizer with
+every meeting (see selected_for_meeting / config.self_profile_*), so the
+recorder's own voice — the one voice we can identify with high precision — is
+named automatically. Everyone else stays "Speaker A/B" and is named after the
+meeting via the rename flow. We deliberately do NOT send other people's
+profiles: anchoring an absent person's name onto whoever sounds closest is
+exactly the confident-but-wrong attribution this design removes.
 
 Profiles are harvested automatically when a speaker is renamed to a real name
-in the app (the existing rename flow), so the library builds itself.
-Everything stays local; clips ride the same OpenAI API call the audio already
-takes. Delete a file in data/voices/ to forget a profile.
+in the app (the existing rename flow), so the library builds itself — that is
+also how the user's own profile comes to exist before they choose it in
+Settings. Everything stays local; the one self clip rides the same OpenAI API
+call the audio already takes. Delete a file in data/voices/ to forget a profile.
 """
 
 import re
@@ -47,9 +51,30 @@ def known_names() -> set:
     return {n for n, _ in list_profiles()}
 
 
-def pick_for_meeting(max_n=MAX_REFS) -> list:
-    """Profiles to send with part 1 of a meeting (most recent first)."""
-    return list_profiles()[:max_n]
+def selected_for_meeting(cfg) -> list:
+    """The single self-profile reference to send with a meeting, or [].
+
+    When the user has enabled auto-identification AND chosen one of their saved
+    profiles AND that <name>.wav still exists, returns exactly [(name, path)] —
+    never more than one. Returns [] if the toggle is off, no profile is chosen,
+    or the chosen file was renamed/deleted, so a stale selection degrades safely
+    to "send nothing" (the diarizer then labels everyone Speaker A/B). This is
+    deliberately the ONLY profile source for the pipeline: no mtime-based
+    "top 4", ever.
+    """
+    try:
+        if not cfg.get("self_profile_enabled"):
+            return []
+        name = _safe(cfg.get("self_profile_name") or "")
+        if not name:
+            return []
+        path = VOICES_DIR / (name + ".wav")
+        if not path.is_file():
+            return []
+        return [(name, str(path))]
+    except Exception as e:
+        config.log("self voice profile selection failed: %s" % e)
+        return []
 
 
 def save_profile(name: str, src_audio, start_s: float, dur_s: float) -> str:
