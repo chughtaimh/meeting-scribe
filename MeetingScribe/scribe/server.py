@@ -9,6 +9,7 @@ from pathlib import Path
 
 from flask import (Flask, jsonify, request, send_file, send_from_directory,
                    abort)
+from werkzeug.exceptions import HTTPException
 
 from . import __version__, config, db, jobs, oai, pipeline, search, store
 
@@ -22,8 +23,20 @@ def _err(msg, code=400):
     return jsonify({"error": str(msg)}), code
 
 
+@app.errorhandler(HTTPException)
+def _http_err(e):
+    # Pass HTTP errors (404/405/413/…) through with their real status code and
+    # message instead of letting the catch-all below coerce them to 500. These
+    # are normal client-side outcomes (missing file, unknown route, oversized
+    # upload), so they are NOT logged as server errors — that kept the
+    # troubleshooting log (scribe.log) drowning in false "server error" lines.
+    return jsonify({"error": e.description or e.name}), e.code
+
+
 @app.errorhandler(Exception)
 def _unhandled(e):
+    if isinstance(e, HTTPException):   # defensive: never coerce a real HTTP code
+        return _http_err(e)
     config.log("server error: %r" % e)
     return _err(str(e) or e.__class__.__name__, 500)
 
