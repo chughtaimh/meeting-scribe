@@ -59,6 +59,23 @@ def _headers(cfg):
     return {"Authorization": "Bearer %s" % key}
 
 
+def _rewind_files(files):
+    """Seek any open file handles in a multipart ``files`` dict back to the
+    start so a retried request re-sends the full body. ``requests`` reads file
+    objects from their current position; after one attempt streams the file to
+    EOF, a retry would otherwise upload zero bytes (an empty audio file)."""
+    if not files:
+        return
+    for val in files.values():
+        fh = val[1] if isinstance(val, (tuple, list)) and len(val) > 1 else val
+        seek = getattr(fh, "seek", None)
+        if callable(seek):
+            try:
+                seek(0)
+            except (OSError, ValueError):
+                pass
+
+
 def _post(cfg, path, *, data=None, files=None, json_body=None, timeout=(15, 900),
           retries=3):
     with _api_gate():
@@ -71,6 +88,7 @@ def _post_inner(cfg, path, *, data=None, files=None, json_body=None,
     url = cfg["openai_base_url"].rstrip("/") + path
     last = None
     for attempt in range(retries):
+        _rewind_files(files)   # re-send the full body on every attempt (incl. retries)
         try:
             r = requests.post(url, headers=_headers(cfg), data=data, files=files,
                               json=json_body, timeout=timeout)
