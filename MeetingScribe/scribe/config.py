@@ -54,8 +54,14 @@ DEFAULTS = {
     # which reasoning models (gpt-5*) do far too slowly.
     "cleanup_models": ["gpt-4.1-mini", "gpt-4o-mini"],
     "cleanup_model_active": "",
-    # Pass stored voice profiles (data/voices/) to the diarizer from part 1.
-    "voice_profiles_enabled": True,
+    # The user's own voice profile (data/voices/<name>.wav), sent to the
+    # diarizer with EVERY meeting so the one voice we can identify with high
+    # precision — the person recording — is named automatically. Everyone else
+    # stays "Speaker A/B" and is named after the meeting via the rename flow.
+    # This replaces the old indiscriminate "send the 4 most-recent profiles"
+    # behavior, which stamped absent people's names onto whoever sounded closest.
+    "self_profile_name": "",        # chosen profile name; "" = not set
+    "self_profile_enabled": False,  # master toggle for auto-identifying "me"
     "port": 5723,
     # Per-request audio segment length sent to OpenAI (seconds). Small parts
     # transcribe fast individually and are processed IN PARALLEL; 5 minutes

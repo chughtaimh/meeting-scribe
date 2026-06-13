@@ -11,7 +11,7 @@ from flask import (Flask, jsonify, request, send_file, send_from_directory,
                    abort)
 from werkzeug.exceptions import HTTPException
 
-from . import __version__, config, db, jobs, oai, pipeline, search, store
+from . import __version__, config, db, jobs, oai, pipeline, profiles, search, store
 
 STATIC_DIR = config.APP_DIR / "static"
 
@@ -68,6 +68,8 @@ def state():
         "key_masked": ("•••" + key.strip()[-4:]) if key.strip() else "",
         "transcripts_dir": str(config.transcripts_dir(cfg)),
         "generate_summaries": bool(cfg.get("generate_summaries")),
+        "self_profile_name": cfg.get("self_profile_name") or "",
+        "self_profile_enabled": bool(cfg.get("self_profile_enabled")),
         "month_hours": round(secs / 3600.0, 2),
         "month_cost_est": round(secs / 60.0 * 0.006, 2),
         "active_jobs": jobs.active(),
@@ -92,8 +94,22 @@ def save_settings():
             updates["transcripts_dir"] = p
     if "generate_summaries" in body:
         updates["generate_summaries"] = bool(body["generate_summaries"])
+    if "self_profile_enabled" in body:
+        updates["self_profile_enabled"] = bool(body["self_profile_enabled"])
+    if "self_profile_name" in body:
+        nm = (body["self_profile_name"] or "").strip()
+        if nm and nm not in profiles.known_names():
+            return _err("Unknown voice profile: %s" % nm)
+        updates["self_profile_name"] = nm
     cfg = config.save(updates)
     return jsonify({"ok": True, "transcripts_dir": str(config.transcripts_dir(cfg))})
+
+
+@app.route("/api/profiles")
+def list_voice_profiles():
+    """Saved voice-profile names, for the Settings 'identify me' picker.
+    Names only — the audio clips never leave the machine here."""
+    return jsonify({"profiles": [nm for nm, _ in profiles.list_profiles()]})
 
 
 @app.route("/api/settings/test", methods=["POST"])

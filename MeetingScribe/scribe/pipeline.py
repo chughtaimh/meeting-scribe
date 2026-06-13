@@ -187,11 +187,11 @@ def process(rec_id: str, job):
             offsets.append(acc)
             acc += d if d > 0 else (duration / max(1, n))
 
-        # Stored voice profiles anchor speaker clusters to known people from
-        # the very first part — the main defence against phantom speakers.
-        stored_profiles = (profiles.pick_for_meeting()
-                           if (mode == "meeting"
-                               and cfg.get("voice_profiles_enabled")) else [])
+        # The user's chosen "this is me" profile (0 or 1 entry) anchors the
+        # recorder's own voice from the very first part. Everyone else falls
+        # through to the safe anchor-then-fan-out path and becomes "Speaker A/B".
+        stored_profiles = (profiles.selected_for_meeting(cfg)
+                           if mode == "meeting" else [])
         segments = []
         tracker = _SpeakerTracker(known_names=[nm for nm, _ in stored_profiles])
         full_text_parts = []
