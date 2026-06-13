@@ -79,6 +79,7 @@ const I = {
   folder: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>',
   doc: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>',
   upload: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>',
+  refresh: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>',
 };
 
 /* ---------------- modal ---------------- */
@@ -650,6 +651,19 @@ async function viewTranscript(recId, params) {
   const turns = rec.turns || [];
   const hlStart = params.get("t");
 
+  // AI notes. The "Regenerate notes" affordance is shown only for meetings
+  // that actually have a summary; the body lives in its own node so it can be
+  // refreshed in place after a regenerate (or an instant rename substitution).
+  const summaryCard = rec.summary ? `
+    <div class="card summary" id="summary-card">
+      <div class="sum-body">${mdLite(rec.summary)}</div>
+      ${isMeeting ? `<div class="sum-foot">
+        <button class="btn small" id="btn-regen"
+          title="Rewrite the AI notes from the current transcript and speaker names">
+          ${I.refresh} Regenerate notes</button>
+      </div>` : ""}
+    </div>` : "";
+
   const legend = isMeeting && order.length ? `
     <div class="legend">${order.map(lab => `
       <span class="chip" title="Click to rename">
@@ -688,7 +702,7 @@ async function viewTranscript(recId, params) {
         <button class="btn danger" id="btn-del">${I.trash} Delete</button>
       </div>
     </div>
-    ${rec.summary ? `<div class="card summary">${mdLite(rec.summary)}</div>` : ""}
+    ${summaryCard}
     ${legend}
     <div class="turns">${turnsHtml || `<div class="empty">Transcript is empty.</div>`}</div>
     ${renderPostMeeting(rec, speakers, order)}
@@ -777,6 +791,30 @@ async function viewTranscript(recId, params) {
       }, 250);
     });
   });
+
+  // regenerate AI notes (full re-summary with the current speaker names)
+  const $regen = document.getElementById("btn-regen");
+  if ($regen) {
+    $regen.onclick = async () => {
+      const orig = $regen.innerHTML;
+      $regen.disabled = true;
+      $regen.innerHTML = `${I.refresh} Regenerating…`;
+      $regen.classList.add("spinning");
+      try {
+        const res = await api(`/api/recordings/${recId}/regenerate-notes`, { method: "POST" });
+        rec.summary = res.summary;
+        const body = document.querySelector("#summary-card .sum-body");
+        if (body) body.innerHTML = mdLite(res.summary);
+        toast("Notes regenerated");
+      } catch (e) {
+        toast(e.message, true);
+      } finally {
+        $regen.disabled = false;
+        $regen.innerHTML = orig;
+        $regen.classList.remove("spinning");
+      }
+    };
+  }
 }
 
 function renderPostMeeting(rec, speakers, order) {

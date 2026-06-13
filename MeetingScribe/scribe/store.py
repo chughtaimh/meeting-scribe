@@ -178,8 +178,38 @@ def split_text(text: str, target=700) -> list:
     return parts
 
 
+def _resummarize_labels(summary: str, renamed: dict) -> str:
+    """Substitute literal "Speaker <label>" tokens in a pre-baked summary with
+    corrected display names. ``renamed`` maps {label: display name} and should
+    contain ONLY labels just renamed to a real name (display not starting with
+    "Speaker"); un-renamed speakers and self-persona real-name keys produce no
+    such token and are left untouched. Matching is whole-token and
+    boundary-safe (so "Speaker A" never bites into "Speaker AB"), longest
+    label first. Labels may be multi-char ("S2", "X1") — never assume A-Z.
+    Pure and side-effect free.
+
+    This fixes "Speaker X -> real name". It does NOT rewrite a name that is
+    already real (e.g. re-editing a self-persona's name): no "Speaker <label>"
+    token exists for it. The manual "Regenerate notes" action covers that case.
+    """
+    if not summary or not renamed:
+        return summary
+    out = summary
+    for label in sorted(renamed, key=len, reverse=True):
+        name = (renamed.get(label) or "").strip()
+        if not name:
+            continue
+        pat = re.compile(r"\bSpeaker[ \t\u00a0]+" + re.escape(label)
+                         + r"(?![A-Za-z0-9])")
+        out = pat.sub(lambda m, n=name: n, out)
+    return out
+
+
 def rename_speakers(rec_id: str, mapping: dict) -> dict:
-    """mapping: {label: new display name}. Updates JSON, MD and search index."""
+    """mapping: {label: new display name}. Updates JSON, MD and search index,
+    and flows the corrected names into the pre-baked summary via instant
+    zero-cost token substitution. Returns {"speakers": {...}, "summary": ...}
+    so callers can refresh the UI without a full reload."""
     rec = db.get_recording(rec_id)
     if not rec:
         raise KeyError("Recording not found")
@@ -191,9 +221,23 @@ def rename_speakers(rec_id: str, mapping: dict) -> dict:
         if name:
             speakers[label] = name[:60]
     data["speakers"] = speakers
+
+    # Instant, zero-cost notes fix: substitute "Speaker <label>" tokens in the
+    # stored summary for labels renamed THIS call to a real name, so the AI
+    # notes stop contradicting the (already re-rendered) transcript body.
+    # Empty summaries (quick/voice notes) are left alone.
+    old_summary = data.get("summary") or ""
+    renamed = {lab: speakers[lab] for lab in mapping
+               if lab in speakers and not speakers[lab].lower().startswith("speaker")}
+    summary = _resummarize_labels(old_summary, renamed)
+    if summary != old_summary:
+        data["summary"] = summary
+
     write_transcript_files(folder, {k: v for k, v in data.items() if k != "turns"},
                            data.get("turns") or [])
     db.update_recording(rec_id, speakers_json=json.dumps(speakers, ensure_ascii=False))
+    if summary != old_summary:
+        db.update_recording(rec_id, summary=summary)
     db.refresh_fts_speakers(rec_id, speakers)
 
     # A confirmed rename teaches the system: the name joins the glossary and
@@ -209,7 +253,7 @@ def rename_speakers(rec_id: str, mapping: dict) -> dict:
                 profiles.harvest_from_recording(nm, label, folder, source_turns)
     except Exception as e:
         config.log("post-rename glossary/profile update failed: %s" % e)
-    return speakers
+    return {"speakers": speakers, "summary": summary}
 
 
 def update_title(rec_id: str, title: str) -> str:
@@ -224,6 +268,22 @@ def update_title(rec_id: str, title: str) -> str:
                            data.get("turns") or [])
     db.update_recording(rec_id, title=title)
     return title
+
+
+def update_summary(rec_id: str, summary: str) -> str:
+    """Persist a (re)generated summary to transcript.json, transcript.md and the
+    recordings cache. The title is intentionally NOT touched here — it is edited
+    independently (see update_title). Returns the stored summary."""
+    rec = db.get_recording(rec_id)
+    if not rec:
+        raise KeyError("Recording not found")
+    folder = Path(rec["folder"])
+    data = read_transcript(folder)
+    data["summary"] = summary
+    write_transcript_files(folder, {k: v for k, v in data.items() if k != "turns"},
+                           data.get("turns") or [])
+    db.update_recording(rec_id, summary=summary)
+    return summary
 
 
 def delete_recording(rec_id: str, delete_files=False):

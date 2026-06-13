@@ -178,6 +178,11 @@ input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-so
 .summary h3:first-child { margin-top: 0; }
 .summary ul { margin: 4px 0 10px 20px; padding: 0; }
 .summary li { margin: 3px 0; }
+.summary .sum-foot { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
+.btn.small { padding: 6px 12px; font-size: 13px; border-radius: 8px; }
+.btn.small svg { width: 15px; height: 15px; }
+.btn.spinning svg { animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
 
 .legend { display: flex; gap: 8px; flex-wrap: wrap; margin: 18px 0 6px; }
 .chip {
