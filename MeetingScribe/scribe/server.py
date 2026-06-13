@@ -186,6 +186,85 @@ def _run_pipeline(rec_id, job):
     search.invalidate_cache()
 
 
+# ---------- quick transcribe (ephemeral, no storage) ----------
+#
+# Quick Transcribe is a lightweight "speak, stop, copy" tool: the audio goes
+# straight to OpenAI, the text comes straight back, and nothing is kept — no
+# library row, no transcript folder, no search index, no AI title/summary, no
+# ffmpeg re-encode. This endpoint is synchronous on purpose; the recordings
+# pipeline (segmentation, diarization, reconcile, cleanup, embeddings) is for
+# meetings only and never runs here.
+
+# OpenAI's single-request audio ceiling. A "quick note" is far below this; only
+# an unusually long capture would need the segmented path, handled gracefully.
+_OAI_AUDIO_LIMIT = 25 * 1024 * 1024  # 25 MB
+
+
+@app.route("/api/transcribe", methods=["POST"])
+def quick_transcribe():
+    """Transcribe an uploaded audio blob and return the text. Stores nothing."""
+    cfg = config.load()
+    if not (cfg.get("openai_api_key") or "").strip():
+        return _err("No OpenAI API key set. Add it in Settings.")
+
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return _err("No audio received")
+    ext = Path(f.filename).suffix.lower() or ".webm"
+    if ext not in (".webm", ".ogg", ".m4a", ".mp3", ".wav", ".mp4", ".aac",
+                   ".flac", ".oga", ".opus", ".mov"):
+        return _err("Unsupported audio format: %s" % ext)
+
+    config.ensure_dirs()
+    tmp = config.TMP_DIR / ("quick_%s%s" % (uuid.uuid4().hex[:12], ext))
+    f.save(str(tmp))
+    try:
+        if tmp.stat().st_size < 200:
+            return _err("No audio was captured. Check the microphone permission "
+                        "for your browser in System Settings → Privacy & Security.")
+
+        # Fast path: one direct OpenAI call, no ffmpeg, no temp re-encoding.
+        if tmp.stat().st_size <= _OAI_AUDIO_LIMIT:
+            text = oai.transcribe_quick(cfg, tmp)
+        else:
+            # Rare: capture exceeds the single-request limit. Down-convert to
+            # 16 kHz mono Opus parts and transcribe them in parallel, then join.
+            text = _quick_transcribe_large(cfg, tmp)
+
+        if not text:
+            return _err("OpenAI returned an empty transcript. The audio may be silent.")
+        return jsonify({"ok": True, "text": text})
+    except oai.OAIError as e:
+        return _err(str(e), 400)
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _quick_transcribe_large(cfg, src):
+    """Fallback for oversized quick captures: segment + parallel transcribe +
+    join. Still ephemeral — the temp parts live in a scratch dir we delete."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import shutil as _shutil
+    from . import audio
+    work = config.TMP_DIR / ("quicklarge_" + uuid.uuid4().hex[:12])
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        parts = audio.normalize_and_segment(src, work, 300)
+        workers = max(1, int(cfg.get("transcribe_concurrency") or 4))
+        texts = {}
+        with ThreadPoolExecutor(max_workers=min(workers, len(parts))) as ex:
+            futs = {ex.submit(oai.transcribe_quick, cfg, p): i
+                    for i, p in enumerate(parts)}
+            for fut in as_completed(futs):
+                texts[futs[fut]] = fut.result()
+        return "\n\n".join(texts[i] for i in sorted(texts) if texts[i]).strip()
+    finally:
+        _shutil.rmtree(str(work), ignore_errors=True)
+
+
 @app.route("/api/recordings/import", methods=["POST"])
 def rec_import():
     f = request.files.get("file")

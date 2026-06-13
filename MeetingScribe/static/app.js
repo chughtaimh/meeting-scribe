@@ -97,6 +97,7 @@ const Rec = {
   mediaStream: null, recorder: null, mime: "", startTs: 0, pausedTotal: 0,
   pauseStart: 0, uploadChain: Promise.resolve(), pendingUploads: 0,
   audioCtx: null, analyser: null, raf: 0, meterHistory: [], wakeLock: null,
+  localChunks: null,  // quick mode keeps blobs in memory (nothing is stored server-side)
 
   elapsed() {
     if (!this.startTs) return 0;
@@ -119,12 +120,24 @@ const Rec = {
     const constraints = { audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: false };
     if (deviceId) constraints.audio.deviceId = { exact: deviceId };
     this.mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
-    const { id } = await api("/api/recordings/start", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mode }),
-    });
-    this.id = id; this.mode = mode;
+    this.mode = mode;
     this.mime = this.pickMime();
+
+    // Quick mode is ephemeral: record into memory, transcribe on stop, store
+    // nothing server-side. Only meeting mode streams chunks to disk (crash-safe
+    // for long recordings) and runs the full pipeline.
+    if (mode === "quick") {
+      this.id = null;
+      this.localChunks = [];
+    } else {
+      const { id } = await api("/api/recordings/start", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode }),
+      });
+      this.id = id;
+      this.localChunks = null;
+    }
+
     this.recorder = new MediaRecorder(this.mediaStream, this.mime ? { mimeType: this.mime, audioBitsPerSecond: 48000 } : undefined);
     this.mime = this.recorder.mimeType || this.mime || "audio/webm";
     this.uploadChain = Promise.resolve(); this.pendingUploads = 0;
@@ -132,6 +145,10 @@ const Rec = {
     this.recorder.ondataavailable = (e) => {
       if (!e.data || !e.data.size) return;
       const blob = e.data;
+      if (this.mode === "quick") {
+        this.localChunks.push(blob);   // keep locally; nothing uploaded
+        return;
+      }
       this.pendingUploads++;
       this.uploadChain = this.uploadChain.then(async () => {
         for (let attempt = 0; attempt < 3; attempt++) {
@@ -178,6 +195,7 @@ const Rec = {
     if (!this.active) return null;
     const id = this.id, mode = this.mode, mime = this.mime;
     const duration = this.elapsed();
+    const localChunks = this.localChunks;
     this.active = false;
     window.onbeforeunload = null;
 
@@ -190,10 +208,22 @@ const Rec = {
     try { this.audioCtx?.close(); } catch (e) {}
     cancelAnimationFrame(this.raf);
     this.analyser = null; this.recorder = null; this.mediaStream = null;
-    this.id = null; this.startTs = 0;
+    this.id = null; this.startTs = 0; this.localChunks = null;
+
+    if (cancel) return null;
+
+    // Quick mode: send the in-memory audio for one-shot transcription and
+    // return the text. Nothing is stored — no library row, no files.
+    if (mode === "quick") {
+      const blob = new Blob(localChunks || [], { type: mime || "audio/webm" });
+      const ext = (mime || "").includes("mp4") ? "m4a" : "webm";
+      const fd = new FormData();
+      fd.append("file", blob, "audio." + ext);
+      const res = await api("/api/transcribe", { method: "POST", body: fd });
+      return { text: (res && res.text) || "" };
+    }
 
     await this.uploadChain;             // drain pending chunk uploads
-    if (cancel) return null;
     await api(`/api/recordings/${id}/finish`, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ mode, mime, duration }),
@@ -387,7 +417,7 @@ async function viewRecord(mode) {
   }
   $view.innerHTML = `
     <div class="card recwrap">
-      <span class="modechip">${isMeeting ? I.users + " Meeting Recording — speakers will be detected" : I.mic + " Quick Transcribe"}</span>
+      <span class="modechip">${isMeeting ? I.users + " Meeting Recording — speakers will be detected" : I.mic + " Quick Transcribe — fast text, not saved"}</span>
       <div class="timer" id="timer">0:00</div>
       <div class="recstate" id="recstate">Ready when you are</div>
       <canvas id="meter"></canvas>
@@ -459,12 +489,53 @@ async function viewRecord(mode) {
 
   const stop = async () => {
     clearInterval(tick);
+    if (mode === "quick") {
+      // Ephemeral path: transcribe in place and show the text. No navigation,
+      // no processing screen, no stored recording.
+      $state.textContent = "Transcribing…";
+      $btns.innerHTML = "";
+      try {
+        const res = await Rec.stop(false);
+        showQuickResult((res && res.text) || "");
+      } catch (e) {
+        toast(e.message, true);
+        $state.textContent = "Something went wrong";
+        renderButtons();
+      }
+      return;
+    }
     $state.textContent = "Saving audio…";
     try {
       const id = await Rec.stop(false);
       if (id) location.hash = "#/processing/" + id;
     } catch (e) { toast(e.message, true); $state.textContent = "Something went wrong"; renderButtons(); }
   };
+
+  // Render the finished quick transcript inline with copy + record-again.
+  function showQuickResult(text) {
+    $view.innerHTML = `
+      <div class="card recwrap" style="text-align:left">
+        <div style="display:flex;align-items:center;gap:10px;justify-content:space-between;flex-wrap:wrap">
+          <h1 style="margin:0;font-size:22px">✅ Transcribed</h1>
+          <div style="display:flex;gap:8px">
+            <button class="btn primary" id="btn-copy">${I.copy} Copy text</button>
+            <button class="btn" id="btn-again">${I.mic} New transcription</button>
+            <button class="btn" onclick="location.hash='#/'">Home</button>
+          </div>
+        </div>
+        <p class="muted small" style="margin:8px 0 0">Not saved — copy the text before you leave this page.</p>
+        <div class="quicktext" id="quicktext">${esc(text) || "<span class='muted'>No speech detected.</span>"}</div>
+      </div>`;
+    document.getElementById("btn-again").onclick = () => { location.hash = "#/"; setTimeout(() => location.hash = "#/record/quick", 0); };
+    document.getElementById("btn-copy").onclick = async () => {
+      try { await navigator.clipboard.writeText(text); toast("Copied to clipboard"); }
+      catch (e) {
+        const r = document.createRange(); r.selectNodeContents(document.getElementById("quicktext"));
+        const s = getSelection(); s.removeAllRanges(); s.addRange(r);
+        document.execCommand("copy"); toast("Copied");
+      }
+    };
+  }
 
   renderButtons();
 }
