@@ -395,7 +395,8 @@ def process(rec_id: str, job):
         # Embeddings for semantic search (best-effort)
         job.set(stage="indexing", detail="Indexing for search…", pct=90)
         try:
-            missing = db.chunks_missing_vectors(rec_id)
+            missing = db.chunks_missing_vectors(
+                rec_id, min_chars=int(cfg.get("search_min_semantic_chars") or 0))
             if missing:
                 vecs = oai.embed(cfg, [t for _, t in missing])
                 db.store_vectors(list(zip([cid for cid, _ in missing], vecs)))
@@ -414,7 +415,8 @@ def process(rec_id: str, job):
 def reembed_missing():
     """Embed any chunks that lack vectors (used after rescan)."""
     cfg = config.load()
-    missing = db.chunks_missing_vectors()
+    missing = db.chunks_missing_vectors(
+        min_chars=int(cfg.get("search_min_semantic_chars") or 0))
     if not missing:
         return 0
     vecs = oai.embed(cfg, [t for _, t in missing])

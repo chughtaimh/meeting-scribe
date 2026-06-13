@@ -861,7 +861,12 @@ async function viewLibrary(params) {
   $q.addEventListener("input", onInput);
   $q.focus();
 
-  q0 ? renderSearch(q0) : renderAll();
+  // Initial render from the URL. lastQuery must be primed to the query we're
+  // about to run, otherwise renderSearch's stale-response guard (lastQuery !== q)
+  // aborts the very first search and the view is stuck on "Searching…".
+  const initialQ = q0.trim();
+  lastQuery = initialQ;
+  initialQ ? renderSearch(initialQ) : renderAll();
 }
 
 /* ----- settings ----- */

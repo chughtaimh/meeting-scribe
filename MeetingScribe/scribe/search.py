@@ -53,6 +53,12 @@ def _vector_search(query: str, limit=30):
     if not ids:
         return []
     cfg = config.load()
+    floor = float(cfg.get("search_semantic_floor") or 0.18)
+    min_chars = int(cfg.get("search_min_semantic_chars") or 0)
+    # Short conversational fragments ("so", "okay", "which") embed close to
+    # almost any query and would otherwise dominate semantic results with
+    # noise. Drop them from the vector side here (they stay keyword-searchable).
+    short_ids = db.short_chunk_ids(min_chars) if min_chars > 0 else set()
     try:
         qv = oai.embed_one(cfg, query)
     except Exception as e:
@@ -62,17 +68,34 @@ def _vector_search(query: str, limit=30):
         q = _np.asarray(qv, dtype=_np.float32)
         qn = float(_np.linalg.norm(q)) or 1.0
         sims = (mat @ q) / (norms * qn)
-        order = sims.argsort()[::-1][:limit]
-        return [(ids[int(i)], float(sims[int(i)])) for i in order
-                if float(sims[int(i)]) > 0.18]
+        # Walk the full descending-similarity order, skipping short fragments,
+        # until we have `limit` hits or drop below the floor. We must NOT
+        # pre-slice the order: when many short fragments sit at the very top
+        # (a single-word query like "google" can have dozens), a fixed window
+        # would be all fragments and starve the result of real matches.
+        order = sims.argsort()[::-1]
+        out = []
+        for i in order:
+            i = int(i)
+            s = float(sims[i])
+            if s <= floor:
+                break
+            if ids[i] in short_ids:
+                continue
+            out.append((ids[i], s))
+            if len(out) >= limit:
+                break
+        return out
     # pure-python fallback
     qn = (sum(x * x for x in qv) ** 0.5) or 1.0
     scored = []
     for i, v in enumerate(mat):
+        if ids[i] in short_ids:
+            continue
         dot = sum(a * b for a, b in zip(v, qv))
         scored.append((ids[i], dot / (norms[i] * qn)))
     scored.sort(key=lambda t: -t[1])
-    return [(cid, s) for cid, s in scored[:limit] if s > 0.18]
+    return [(cid, s) for cid, s in scored[:limit] if s > floor]
 
 
 def _snippet(text: str, query: str, width=240) -> str:

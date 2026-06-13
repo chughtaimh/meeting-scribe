@@ -29,6 +29,20 @@ DEFAULTS = {
     "quick_model": "gpt-4o-transcribe",
     "quick_model_fallback": "whisper-1",
     "embedding_model": "text-embedding-3-small",
+    # Semantic search quality: very short transcript fragments ("so", "okay",
+    # "which") carry no retrievable meaning, yet their embeddings sit close to
+    # almost any query and flood results with noise. Chunks with fewer than
+    # this many characters are excluded from the *vector* (semantic) side of
+    # search and are not embedded going forward. They remain fully keyword-
+    # searchable, so a genuine short utterance ("Google ads.") is still found
+    # when the literal word is typed. 25 was chosen empirically against real
+    # transcripts: it removes near-noise fragments while every substantive
+    # passage that is shorter is also a keyword match and so still surfaces.
+    "search_min_semantic_chars": 25,
+    # Backstop cosine-similarity floor for semantic hits. Kept below the
+    # similarity of the weakest genuine matches observed in real transcripts
+    # (~0.29) so it never clips a real result — it only trims residual noise.
+    "search_semantic_floor": 0.22,
     # Tried in order until one works; the winner is cached in "summary_model_active".
     "summary_models": ["gpt-5-mini", "gpt-4.1-mini", "gpt-4o-mini"],
     "summary_model_active": "",

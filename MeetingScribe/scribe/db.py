@@ -182,6 +182,18 @@ def chunks_by_ids(ids):
         return {r["id"]: dict(r) for r in rows}
 
 
+def short_chunk_ids(min_chars: int):
+    """Chunk ids whose trimmed text is shorter than min_chars. Used to keep
+    meaningless fragments out of semantic search. Returns a set for O(1) lookup."""
+    if not min_chars or min_chars <= 0:
+        return set()
+    with connect() as con:
+        rows = con.execute(
+            "SELECT id FROM chunks WHERE LENGTH(TRIM(text)) < ?", (min_chars,)
+        ).fetchall()
+        return {r["id"] for r in rows}
+
+
 # ---------- vectors ----------
 
 def store_vectors(pairs):
@@ -205,13 +217,19 @@ def all_vectors():
     return ids, vecs
 
 
-def chunks_missing_vectors(rec_id=None):
+def chunks_missing_vectors(rec_id=None, min_chars=0):
+    """Chunks that have no embedding yet. Fragments shorter than min_chars are
+    intentionally never embedded (they only add noise to semantic search), so
+    they are excluded here and won't be re-queued on every reindex."""
     sql = ("SELECT c.id, c.text FROM chunks c LEFT JOIN vectors v ON v.chunk_id=c.id "
            "WHERE v.chunk_id IS NULL")
-    args = ()
+    args = []
+    if min_chars and min_chars > 0:
+        sql += " AND LENGTH(TRIM(c.text)) >= ?"
+        args.append(min_chars)
     if rec_id:
         sql += " AND c.rec_id=?"
-        args = (rec_id,)
+        args.append(rec_id)
     with connect() as con:
         return [(r["id"], r["text"]) for r in con.execute(sql, args).fetchall()]
 
