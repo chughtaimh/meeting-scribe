@@ -78,20 +78,18 @@ def _rewind_files(files):
 
 def _post(cfg, path, *, data=None, files=None, json_body=None, timeout=(15, 900),
           retries=3):
-    with _api_gate():
-        return _post_inner(cfg, path, data=data, files=files,
-                           json_body=json_body, timeout=timeout, retries=retries)
-
-
-def _post_inner(cfg, path, *, data=None, files=None, json_body=None,
-                timeout=(15, 900), retries=3):
     url = cfg["openai_base_url"].rstrip("/") + path
     last = None
     for attempt in range(retries):
         _rewind_files(files)   # re-send the full body on every attempt (incl. retries)
         try:
-            r = requests.post(url, headers=_headers(cfg), data=data, files=files,
-                              json=json_body, timeout=timeout)
+            # Hold the global concurrency gate ONLY around the network call.
+            # The backoff sleeps below run OUTSIDE the gate, so a call that is
+            # merely waiting to retry releases its slot instead of stalling
+            # every other OpenAI request during a rate-limit/backoff window.
+            with _api_gate():
+                r = requests.post(url, headers=_headers(cfg), data=data,
+                                  files=files, json=json_body, timeout=timeout)
         except requests.RequestException as e:
             last = OAIError("Network error talking to OpenAI: %s" % e)
             time.sleep(1.5 * (attempt + 1))
