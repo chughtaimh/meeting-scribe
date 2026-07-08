@@ -20,7 +20,7 @@ That's it. After the first run you can use either `Start Meeting Scribe.command`
 
 **Meeting Recording** — records the room, then produces a transcript **broken up by speaker** ("Speaker A", "Speaker B", …), with timestamps, an AI-written title, an executive summary, decisions, and action items. Click any speaker name to replace it with the person's real name — the transcript and search index update everywhere.
 
-Tip for video calls: play the other side through your **speakers** (not headphones) so the microphone hears everyone.
+Tip for video calls: leave **"Also capture computer audio"** ticked. Everything you hear (Google Meet, Zoom, any app) is recorded alongside your microphone **automatically — no dialogs**, thanks to a one-time setup: the free [BlackHole](https://github.com/ExistentialAudio/BlackHole) loopback driver plus a **"Meeting Scribe Output"** multi-output device that mirrors your sound into it. Keep your Mac's sound output set to **Meeting Scribe Output** (Control Center → Sound). Two caveats: the volume keys don't adjust a multi-output device (change volume on the underlying speakers/headphones in Sound settings), and if macOS switches output (AirPods connect, display unplugged) just re-select Meeting Scribe Output — the app warns you mid-recording if computer audio goes silent.
 
 ## Where transcripts live
 
@@ -48,6 +48,7 @@ Transcription ≈ **$0.36 per hour of audio**; summaries and search cost fractio
 - **macOS blocks the app the first time:** right-click → Open → Open.
 - **"Python 3 is needed":** macOS shows an install popup — click Install, wait, then launch again (one-time).
 - **Mic doesn't record:** System Settings → Privacy & Security → Microphone → enable your browser. Then reload the app.
+- **"Computer-audio capture isn't set up" / "No computer audio detected":** check that **Meeting Scribe Output** is your Mac's sound output (Control Center → Sound). If the device is missing entirely, re-run the setup helper from this folder: `swiftc -O MeetingScribe/tools/setup_audio.swift -o /tmp/setup_audio && /tmp/setup_audio` (recreates the multi-output device and selects it). If BlackHole itself is gone, reinstall it: `brew install --cask blackhole-2ch`.
 - **Key errors:** Settings → Save & test shows exactly what's wrong (invalid key, no credit, etc.).
 - **Something else:** the log lives at `MeetingScribe/data/scribe.log`.
 - **Quitting:** the app runs quietly in the background; quit it from **Settings → Quit Meeting Scribe**.

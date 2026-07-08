@@ -147,6 +147,8 @@ const Rec = {
   pauseStart: 0, uploadChain: Promise.resolve(), pendingUploads: 0,
   audioCtx: null, analyser: null, raf: 0, meterHistory: [], wakeLock: null,
   localChunks: null,  // quick mode keeps blobs in memory (nothing is stored server-side)
+  mixCtx: null, rawStreams: [],  // computer-audio capture: source streams behind the mixed stream
+  loopAnalyser: null, loopLoud: 0, loopWarned: false, loopTimer: 0,  // watches the loopback for broken routing
 
   elapsed() {
     if (!this.startTs) return 0;
@@ -162,13 +164,81 @@ const Rec = {
     return "";
   },
 
-  async start(mode, deviceId) {
+  // Computer audio (the other side of a Meet/Zoom call, any app) never reaches
+  // the microphone. The one-time setup routes everything the Mac plays into the
+  // BlackHole loopback driver (via the "Meeting Scribe Output" multi-output
+  // device), so capturing it is just a second getUserMedia input — no dialogs.
+  async captureComputerAudio() {
+    let devs = [];
+    try { devs = await navigator.mediaDevices.enumerateDevices(); } catch (e) {}
+    const loop = devs.find(d => d.kind === "audioinput" && /blackhole/i.test(d.label || ""));
+    if (!loop) {
+      const err = new Error("Computer-audio capture isn't set up on this Mac (the BlackHole loopback device wasn't found — see READ ME FIRST). Untick “Also capture computer audio” to record the microphone only.");
+      err.name = "NoLoopback";
+      throw err;
+    }
+    return navigator.mediaDevices.getUserMedia({
+      audio: { deviceId: { exact: loop.deviceId }, echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+      video: false,
+    });
+  },
+
+  async start(mode, deviceId, withComputerAudio) {
     if (this.active) throw new Error("Already recording");
     if (!navigator.mediaDevices || !window.MediaRecorder)
       throw new Error("This browser does not support audio recording.");
+
+    // Mic first: on the very first run this triggers the permission prompt,
+    // which also unlocks the device labels captureComputerAudio needs.
     const constraints = { audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: false };
     if (deviceId) constraints.audio.deviceId = { exact: deviceId };
-    this.mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+    const micStream = await navigator.mediaDevices.getUserMedia(constraints);
+
+    let loopStream = null;
+    if (withComputerAudio) {
+      try {
+        loopStream = await this.captureComputerAudio();
+      } catch (e) {
+        micStream.getTracks().forEach(t => t.stop());
+        throw e;
+      }
+    }
+
+    if (loopStream) {
+      // Mix mic + computer audio into a single stream for the recorder and meter.
+      this.mixCtx = new (window.AudioContext || window.webkitAudioContext)();
+      try { await this.mixCtx.resume(); } catch (e) {}
+      const dest = this.mixCtx.createMediaStreamDestination();
+      this.mixCtx.createMediaStreamSource(micStream).connect(dest);
+      const loopSrc = this.mixCtx.createMediaStreamSource(loopStream);
+      loopSrc.connect(dest);
+      // Watch the loopback on its own: silence there means the Mac's output was
+      // switched away from "Meeting Scribe Output" and call audio is being missed.
+      this.loopAnalyser = this.mixCtx.createAnalyser();
+      this.loopAnalyser.fftSize = 512;
+      loopSrc.connect(this.loopAnalyser);
+      this.loopLoud = Date.now(); this.loopWarned = false;
+      // setInterval, not the rAF meter loop: rAF pauses in background tabs,
+      // and a meeting recording tab usually is one.
+      this.loopTimer = setInterval(() => {
+        if (!this.active || this.paused || !this.loopAnalyser) return;
+        const ld = new Uint8Array(this.loopAnalyser.fftSize);
+        this.loopAnalyser.getByteTimeDomainData(ld);
+        let lsum = 0;
+        for (let i = 0; i < ld.length; i++) { const v = (ld[i] - 128) / 128; lsum += v * v; }
+        if (Math.sqrt(lsum / ld.length) > 0.005) {
+          this.loopLoud = Date.now(); this.loopWarned = false;
+        } else if (!this.loopWarned && Date.now() - this.loopLoud > 2 * 60 * 1000) {
+          this.loopWarned = true;
+          toast("No computer audio detected — check your Mac's sound output is set to “Meeting Scribe Output” (Control Center → Sound). Your microphone is still being recorded.", true);
+        }
+      }, 5000);
+      this.rawStreams = [micStream, loopStream];
+      this.mediaStream = dest.stream;
+    } else {
+      this.rawStreams = [micStream];
+      this.mediaStream = micStream;
+    }
     this.mode = mode;
     this.mime = this.pickMime();
 
@@ -179,10 +249,16 @@ const Rec = {
       this.id = null;
       this.localChunks = [];
     } else {
-      const { id } = await api("/api/recordings/start", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode }),
-      });
+      let id;
+      try {
+        ({ id } = await api("/api/recordings/start", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ mode }),
+        }));
+      } catch (e) {
+        this.releaseStreams();
+        throw e;
+      }
       this.id = id;
       this.localChunks = null;
     }
@@ -230,6 +306,15 @@ const Rec = {
     window.onbeforeunload = () => "Recording in progress — leaving will stop it.";
   },
 
+  releaseStreams() {
+    this.rawStreams.forEach(s => s.getTracks().forEach(t => t.stop()));
+    this.rawStreams = [];
+    this.mediaStream?.getTracks().forEach(t => t.stop());
+    this.mediaStream = null;
+    try { this.mixCtx?.close(); } catch (e) {}
+    this.mixCtx = null;
+  },
+
   pause() {
     if (!this.active || this.paused) return;
     this.recorder.pause(); this.paused = true; this.pauseStart = Date.now();
@@ -238,6 +323,7 @@ const Rec = {
     if (!this.active || !this.paused) return;
     this.recorder.resume(); this.paused = false;
     this.pausedTotal += Date.now() - this.pauseStart;
+    this.loopLoud = Date.now();  // don't warn instantly off a stale pre-pause timestamp
   },
 
   async stop(cancel) {
@@ -252,11 +338,12 @@ const Rec = {
     const stopped = new Promise((res) => { this.recorder.onstop = res; });
     try { this.recorder.state !== "inactive" && this.recorder.stop(); } catch (e) {}
     await Promise.race([stopped, new Promise(r => setTimeout(r, 4000))]);
-    this.mediaStream?.getTracks().forEach(t => t.stop());
+    this.releaseStreams();
     try { await this.wakeLock?.release(); } catch (e) {}
     try { this.audioCtx?.close(); } catch (e) {}
     cancelAnimationFrame(this.raf);
-    this.analyser = null; this.recorder = null; this.mediaStream = null;
+    clearInterval(this.loopTimer); this.loopTimer = 0;
+    this.analyser = null; this.loopAnalyser = null; this.recorder = null;
     this.id = null; this.startTs = 0; this.localChunks = null;
 
     if (cancel) return null;
@@ -471,17 +558,24 @@ async function viewRecord(mode) {
       <div class="recstate" id="recstate">Ready when you are</div>
       <canvas id="meter"></canvas>
       <div class="devrow"><select id="mic-select"><option value="">Default microphone</option></select></div>
+      ${isMeeting ? `<div class="devrow srcrow"><label class="srcopt"><input type="checkbox" id="tab-audio">
+        Also capture computer audio (Google&nbsp;Meet, Zoom, any app)</label></div>` : ""}
       <div class="recbtns" id="recbtns">
         <button class="btn rec big" id="btn-start">${I.mic} Start recording</button>
         <button class="btn big" id="btn-back">Back</button>
       </div>
-      ${isMeeting ? `<p class="muted small" style="margin-top:22px">Tip: for video calls, play the other side through your speakers so the microphone hears everyone.</p>` : ""}
+      ${isMeeting ? `<p class="muted small" style="margin-top:22px">Computer audio — the other side of your calls — is captured automatically, no dialogs. Just keep your Mac's sound output set to “Meeting Scribe Output”.</p>` : ""}
     </div>`;
 
   const $timer = document.getElementById("timer");
   const $state = document.getElementById("recstate");
   const $btns = document.getElementById("recbtns");
   const $mic = document.getElementById("mic-select");
+  const $tab = document.getElementById("tab-audio");
+  if ($tab) {
+    $tab.checked = localStorage.getItem("scribe.tabAudio") !== "0";  // default on
+    $tab.onchange = () => localStorage.setItem("scribe.tabAudio", $tab.checked ? "1" : "0");
+  }
 
   // populate device list (labels appear once permission has been granted)
   try {
@@ -520,7 +614,7 @@ async function viewRecord(mode) {
 
   const start = async () => {
     try {
-      await Rec.start(mode, $mic.value || undefined);
+      await Rec.start(mode, $mic.value || undefined, !!($tab && $tab.checked));
     } catch (e) {
       const msg = (e.name === "NotAllowedError" || e.name === "SecurityError")
         ? "Microphone access was blocked. Allow the microphone for this app in your browser, then try again."
@@ -528,7 +622,7 @@ async function viewRecord(mode) {
       toast(msg, true);
       return;
     }
-    document.querySelector(".devrow").style.display = "none";
+    document.querySelectorAll(".devrow").forEach(el => el.style.display = "none");
     $state.innerHTML = `<span class="dot"></span>Recording`;
     Rec.meterHistory = [];
     Rec.drawMeter(document.getElementById("meter"));
