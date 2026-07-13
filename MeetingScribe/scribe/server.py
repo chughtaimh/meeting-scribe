@@ -306,7 +306,7 @@ def rec_import():
         return _err("Unsupported audio format: %s" % ext)
     rec_id = uuid.uuid4().hex[:12]
     config.ensure_dirs()
-    dest = config.INPROGRESS_DIR / (rec_id + (".m4a" if ext in (".mp4", ".mov", ".aac") else ext))
+    dest = config.INPROGRESS_DIR / (rec_id + (".m4a" if ext == ".aac" else ext))
     f.save(str(dest))
     db.upsert_recording({
         "id": rec_id, "title": "Processing…", "mode": mode,

@@ -464,7 +464,7 @@ async function viewHome() {
     </div>
     <div style="display:flex;justify-content:space-between;align-items:center">
       <h2>Recent</h2>
-      <button class="btn small" id="btn-import">${I.upload} Import audio file</button>
+      <button class="btn small" id="btn-import">${I.upload} Import audio or video file</button>
     </div>
     <div class="list" id="recent"></div>`;
 
@@ -512,7 +512,7 @@ function renderRecList(el, recs, emptyHtml) {
 function importAudio() {
   const input = document.createElement("input");
   input.type = "file";
-  input.accept = "audio/*,video/mp4,.m4a,.webm,.ogg,.opus,.flac";
+  input.accept = "audio/*,video/mp4,video/quicktime,.m4a,.webm,.ogg,.opus,.flac,.mp4,.mov";
   input.onchange = () => {
     const file = input.files[0];
     if (!file) return;
@@ -527,7 +527,7 @@ function importAudio() {
     m.querySelector("#imp-cancel").onclick = closeModal;
     const go = async (mode) => {
       closeModal();
-      toast("Uploading audio…");
+      toast(/\.(mp4|mov)$/i.test(file.name) ? "Uploading video…" : "Uploading audio…");
       const fd = new FormData();
       fd.append("file", file); fd.append("mode", mode);
       try {
@@ -792,6 +792,7 @@ async function viewTranscript(recId, params) {
   const isMeeting = rec.mode === "meeting";
   const turns = rec.turns || [];
   const hlStart = params.get("t");
+  const isVideo = /\.(mp4|mov)$/i.test(rec.audio_file || "");
 
   // AI notes. The "Regenerate notes" affordance is shown only for meetings
   // that actually have a summary; the body lives in its own node so it can be
@@ -857,9 +858,11 @@ async function viewTranscript(recId, params) {
     ${legend}
     <div class="turns">${turnsHtml || `<div class="empty">Transcript is empty.</div>`}</div>
     ${renderPostMeeting(rec, speakers, order)}
-    <div style="height:70px"></div>
-    <div class="audiobar"><div class="inner">
-      <audio id="player" controls preload="metadata" src="/api/recordings/${esc(recId)}/audio"></audio>
+    <div style="height:${isVideo ? 240 : 70}px"></div>
+    <div class="audiobar${isVideo ? " videobar" : ""}"><div class="inner">
+      ${isVideo
+        ? `<video id="player" controls preload="metadata" playsinline src="/api/recordings/${esc(recId)}/audio"></video>`
+        : `<audio id="player" controls preload="metadata" src="/api/recordings/${esc(recId)}/audio"></audio>`}
     </div></div>`;
 
   const player = document.getElementById("player");

@@ -128,6 +128,40 @@ def extract_clip(src, start_s: float, dur_s: float, out_path) -> str:
     return str(out_path)
 
 
+def remux_to_mp4(src, dest) -> bool:
+    """Best-effort .mov -> .mp4 rewrap so the browser <video> element can play
+    it (Chrome refuses video/quicktime). Never raises; returns False when the
+    caller should keep the original file.
+
+    ffmpeg will happily stream-copy PCM audio (ipcm) or ProRes video into an
+    mp4 that no browser can decode, so "did ffmpeg succeed" is not the test —
+    the source codecs are. Video must already be browser-playable (copy only);
+    audio is copied when aac/mp3, else re-encoded to AAC (QuickTime PCM).
+    """
+    dest = Path(dest)
+    proc = _run(["-hide_banner", "-i", str(src)], timeout=60)
+    text = proc.stderr.decode("utf-8", "replace")
+    v = re.search(r": Video: (\w+)", text)
+    a = re.search(r": Audio: (\w+)", text)
+    if not v or v.group(1) not in ("h264", "hevc", "av1", "vp9"):
+        return False
+    args = ["-hide_banner", "-y", "-i", str(src), "-c:v", "copy"]
+    if v.group(1) == "hevc":
+        args += ["-tag:v", "hvc1"]  # Safari needs the hvc1 brand to play HEVC
+    if a and a.group(1) in ("aac", "mp3"):
+        args += ["-c:a", "copy"]
+    else:
+        args += ["-c:a", "aac", "-b:a", "160k"]
+    proc = _run(args + ["-movflags", "+faststart", str(dest)], timeout=1800)
+    if proc.returncode == 0 and dest.exists() and dest.stat().st_size > 0:
+        return True
+    try:
+        dest.unlink()
+    except OSError:
+        pass
+    return False
+
+
 def check() -> str:
     """Returns ffmpeg version string or raises."""
     proc = _run(["-version"], timeout=30)

@@ -373,8 +373,12 @@ def process(rec_id: str, job):
         job.set(stage="saving", detail="Saving transcript…", pct=84)
         folder = store.make_folder(created, title)
         ext = src.suffix or ".webm"
-        audio_name = "audio" + ext
-        shutil.move(str(src), str(folder / audio_name))
+        if ext == ".mov" and audio.remux_to_mp4(src, folder / "audio.mp4"):
+            audio_name = "audio.mp4"
+            src.unlink(missing_ok=True)
+        else:
+            audio_name = "audio" + ext
+            shutil.move(str(src), str(folder / audio_name))
 
         meta = {
             "id": rec_id, "title": title, "mode": mode,
