@@ -1,0 +1,16 @@
+#!/bin/bash
+# Meeting Scribe app launcher (bundled build).
+# The app code lives inside the bundle at Contents/Resources/MeetingScribe;
+# launch.sh detects the bundle path and keeps all writable state in
+# ~/Library/Application Support/MeetingScribe.
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LAUNCH="$DIR/../Resources/MeetingScribe/launch.sh"
+SUPPORT_DIR="$HOME/Library/Application Support/MeetingScribe"
+
+if [ ! -x "$SUPPORT_DIR/.venv/bin/python" ]; then
+  # First run: setup downloads Python packages and can take a couple of
+  # minutes. Run it in a visible Terminal window so progress (and any error)
+  # is on screen instead of hidden in a background process.
+  exec open -a Terminal "$LAUNCH"
+fi
+exec "$LAUNCH" gui
