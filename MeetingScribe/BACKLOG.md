@@ -1,5 +1,19 @@
 # Backlog — deferred ideas and the reasoning behind them
 
+## Anchor from a short prefix instead of a whole first part
+The multi-part path (meetings over ~23 min, i.e. most of them — the diarize
+API rejects >1400 s per request) transcribes part 1 ALONE to harvest speaker
+reference clips, then fans the rest out in parallel. So part length costs
+wall-clock twice: once serially for the anchor, once for the slowest parallel
+round. Measured 2026-08-10: a 20-minute part took >5 min on its own, which is
+why `segment_seconds` is 600 rather than 1200.
+Idea: diarize a short prefix (~5 min) in its own cheap call purely to harvest
+clips, then run ALL real parts in parallel with those references. Wall clock
+becomes prefix + one part instead of one part + one part, and part size can go
+back up (fewer boundaries, fewer fragmented speakers). Cost: one extra call
+over ~5 min of audio per meeting, and the prefix still only sees whoever spoke
+early — the same blind spot the anchor has today.
+
 ## Orphan recovery is unsafe with two instances
 `_recover_orphans` (server.py) runs at every startup and marks any
 `processing` row with no in-process job as a retryable error. With a second

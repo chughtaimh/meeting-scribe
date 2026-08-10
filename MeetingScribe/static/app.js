@@ -782,6 +782,7 @@ async function viewProcessing(recId) {
 /* ----- transcript ----- */
 async function viewTranscript(recId, params) {
   setNav("library");
+  document.body.classList.remove("fixmode");  // re-render always exits fix mode
   let rec;
   try { rec = await api("/api/recordings/" + recId); }
   catch (e) { $view.innerHTML = `<div class="empty">Recording not found.</div>`; return; }
@@ -830,7 +831,7 @@ async function viewTranscript(recId, params) {
     const name = lab ? (speakers[lab] || "Speaker " + lab) : "";
     const color = lab ? speakerColor(lab, order) : "var(--line)";
     const hl = hlStart !== null && Math.abs((t.start_s || 0) - parseFloat(hlStart)) < 0.5 ? " hl" : "";
-    return `<div class="turn${hl}" data-start="${t.start_s || 0}">
+    return `<div class="turn${hl}" data-start="${t.start_s || 0}" data-seq="${t.seq}" data-section="main">
       <div class="bar" style="background:${color}"></div>
       <div style="flex:1;min-width:0">
         ${lab ? `<div class="who" style="color:${color}">${esc(name)}
@@ -851,6 +852,8 @@ async function viewTranscript(recId, params) {
         <button class="btn" id="btn-copy-all">${I.copy} Copy transcript</button>
         <a class="btn" href="/api/recordings/${esc(recId)}/file/md">${I.download} Markdown</a>
         <a class="btn" href="/api/recordings/${esc(recId)}/file/json">${I.doc} JSON</a>
+        ${isMeeting && turns.length ? `<button class="btn" id="btn-fixspk"
+          title="Move wrongly attributed lines to the right speaker">${I.users} Fix speakers</button>` : ""}
         <button class="btn danger" id="btn-del">${I.trash} Delete</button>
       </div>
     </div>
@@ -858,6 +861,16 @@ async function viewTranscript(recId, params) {
     ${legend}
     <div class="turns">${turnsHtml || `<div class="empty">Transcript is empty.</div>`}</div>
     ${renderPostMeeting(rec, speakers, order)}
+    ${isMeeting && turns.length ? `
+    <div class="assignbar${isVideo ? " overvideo" : ""}" id="assignbar" hidden><div class="inner">
+      <span id="fix-count" class="muted small">0 selected</span>
+      <select id="fix-target">
+        ${order.map(l => `<option value="${esc(l)}">${esc(speakers[l] || "Speaker " + l)}</option>`).join("")}
+        <option value="__new__">New speaker…</option>
+      </select>
+      <button class="btn primary small" id="fix-apply" disabled>Assign</button>
+      <button class="btn small" id="fix-cancel">Done</button>
+    </div></div>` : ""}
     <div style="height:${isVideo ? 240 : 70}px"></div>
     <div class="audiobar${isVideo ? " videobar" : ""}"><div class="inner">
       ${isVideo
@@ -974,8 +987,92 @@ async function viewTranscript(recId, params) {
     });
   });
 
+  // "Fix speakers" mode: select wrongly attributed turns, assign them to an
+  // existing or brand-new speaker. The repair for a diarizer that joined two
+  // people under one label — renaming alone can't separate them.
+  const $fixspk = document.getElementById("btn-fixspk");
+  if ($fixspk) {
+    const bar = document.getElementById("assignbar");
+    const $count = document.getElementById("fix-count");
+    const $apply = document.getElementById("fix-apply");
+    let fixing = false;
+    const selected = () => [...document.querySelectorAll(".turn.sel")];
+    const updateCount = () => {
+      const n = selected().length;
+      $count.textContent = `${n} turn${n === 1 ? "" : "s"} selected`;
+      $apply.disabled = !n;
+    };
+    const setFixing = (on) => {
+      fixing = on;
+      document.body.classList.toggle("fixmode", on);
+      bar.hidden = !on;
+      $fixspk.classList.toggle("primary", on);
+      if (!on) selected().forEach(el => el.classList.remove("sel"));
+      updateCount();
+    };
+    $fixspk.onclick = () => setFixing(!fixing);
+    document.getElementById("fix-cancel").onclick = () => setFixing(false);
+    document.querySelectorAll(".turn[data-seq]").forEach(el => {
+      el.addEventListener("click", (e) => {
+        if (!fixing || e.target.closest(".ts")) return;  // timestamps still seek
+        el.classList.toggle("sel");
+        updateCount();
+      });
+    });
+    const reassign = async (body) => {
+      const els = selected();
+      const sections = new Set(els.map(el => el.dataset.section || "main"));
+      if (sections.size > 1) {
+        toast("Select turns from one section at a time", true);
+        return;
+      }
+      const seqs = els.map(el => parseInt(el.dataset.seq, 10));
+      try {
+        await api(`/api/recordings/${recId}/turns/reassign`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(Object.assign(
+            { seqs, section: [...sections][0] || "main" }, body)),
+        });
+        toast("Speakers updated");
+        if (rec.summary) sessionStorage.setItem("nudgeRegen:" + recId, "1");
+        viewTranscript(recId, params);   // re-render legend, colors, counts
+      } catch (e) { toast(e.message, true); }
+    };
+    $apply.onclick = () => {
+      if (!selected().length) return;
+      const choice = document.getElementById("fix-target").value;
+      if (choice !== "__new__") { reassign({ to_label: choice }); return; }
+      const m = showModal(`
+        <h3>New speaker</h3>
+        <p class="muted small">The selected turns move to a new speaker. Name them now, or leave blank to name later.</p>
+        <input type="text" id="ns-name" placeholder="Name (optional)" style="width:100%">
+        <div class="foot">
+          <button class="btn" id="ns-cancel">Cancel</button>
+          <button class="btn primary" id="ns-ok">Assign</button>
+        </div>`);
+      m.querySelector("#ns-cancel").onclick = closeModal;
+      const ok = () => {
+        const nm = m.querySelector("#ns-name").value.trim();
+        closeModal();
+        reassign({ new_speaker: true, name: nm });
+      };
+      m.querySelector("#ns-ok").onclick = ok;
+      m.querySelector("#ns-name").addEventListener("keydown",
+        (e) => { if (e.key === "Enter") ok(); });
+      m.querySelector("#ns-name").focus();
+    };
+  }
+
   // regenerate AI notes (full re-summary with the current speaker names)
   const $regen = document.getElementById("btn-regen");
+  if ($regen && sessionStorage.getItem("nudgeRegen:" + recId)) {
+    // A reassignment just changed attribution — the baked notes may credit
+    // the wrong person. Nudge, never auto-spend an LLM call.
+    sessionStorage.removeItem("nudgeRegen:" + recId);
+    $regen.classList.add("pulse");
+    setTimeout(() => $regen.classList.remove("pulse"), 6000);
+    toast("Notes may mention the old attribution — Regenerate notes?");
+  }
   if ($regen) {
     $regen.onclick = async () => {
       const orig = $regen.innerHTML;
@@ -1007,7 +1104,7 @@ function renderPostMeeting(rec, speakers, order) {
     const lab = t.speaker || "";
     const name = lab ? (speakers[lab] || "Speaker " + lab) : "";
     const color = lab ? speakerColor(lab, order) : "var(--line)";
-    return `<div class="turn" data-start="${t.start_s || 0}">
+    return `<div class="turn" data-start="${t.start_s || 0}" data-seq="${t.seq}" data-section="post">
       <div class="bar" style="background:${color};opacity:.45"></div>
       <div style="flex:1;min-width:0">
         ${lab ? `<div class="who" style="color:${color};opacity:.75">${esc(name)}

@@ -402,6 +402,31 @@ def rec_speakers(rec_id):
                     "summary": res["summary"]})
 
 
+@app.route("/api/recordings/<rec_id>/turns/reassign", methods=["POST"])
+def rec_reassign_turns(rec_id):
+    """Move selected turns to another (or a brand-new) speaker — the manual
+    fix when the diarizer joined two people under one label."""
+    body = request.get_json(force=True, silent=True) or {}
+    seqs = body.get("seqs")
+    if not isinstance(seqs, list) or not seqs:
+        return _err("seqs must be a non-empty list")
+    section = (body.get("section")
+               if body.get("section") in ("main", "post") else "main")
+    new_speaker = bool(body.get("new_speaker"))
+    to_label = None if new_speaker else body.get("to_label")
+    if not new_speaker and not to_label:
+        return _err("Provide to_label or new_speaker")
+    try:
+        res = store.reassign_turns(rec_id, seqs, to_label=to_label,
+                                   new_name=body.get("name"), section=section)
+    except KeyError:
+        return _err("Not found", 404)
+    except (ValueError, TypeError) as e:
+        return _err(str(e))
+    search.invalidate_cache()
+    return jsonify({"ok": True, **res})
+
+
 @app.route("/api/recordings/<rec_id>/regenerate-notes", methods=["POST"])
 def rec_regenerate_notes(rec_id):
     """Rewrite the AI meeting notes from the CURRENT transcript + speaker names.

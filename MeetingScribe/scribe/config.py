@@ -86,11 +86,22 @@ DEFAULTS = {
     "self_profile_name": "",        # chosen profile name; "" = not set
     "self_profile_enabled": False,  # master toggle for auto-identifying "me"
     "port": 5723,
-    # Per-request audio segment length sent to OpenAI (seconds). Small parts
-    # transcribe fast individually and are processed IN PARALLEL; 5 minutes
-    # balances per-request latency against diarization context per part.
-    # (Hard API ceiling is ~1400s per chunk.)
-    "segment_seconds": 300,
+    # Meetings up to this duration are diarized in ONE request — the API
+    # keeps speaker labels consistent within a request, so no cross-part
+    # stitching (the main source of wrongly merged speakers). The API rejects
+    # requests over 1400 s of audio regardless of chunking_strategy (verified
+    # 2026-08-10: "audio duration ... longer than 1400 seconds which is the
+    # maximum for this model"), so this caps just under. Longer meetings fall
+    # back to the parallel per-part path below.
+    "single_call_max_seconds": 1380,
+    # Fallback-path segment length (seconds), used only past the single-call
+    # cap. Transcription time scales with part length (a 20-minute part
+    # measured >5 min on its own), and the anchor part runs alone before the
+    # rest fan out, so oversized parts cost wall-clock twice over. 10 minutes
+    # keeps all 4 workers busy while giving the anchor enough coverage to
+    # sample most speakers. Voices missed by the anchor now stay separate
+    # rather than being folded into someone else (see scribe/reconcile.py).
+    "segment_seconds": 600,
     # Max simultaneous OpenAI calls, shared across all recordings being
     # processed (keeps rate-limit pressure bounded).
     "transcribe_concurrency": 4,
@@ -108,7 +119,7 @@ def ensure_dirs():
 # the full config (defaults included), freezing them in config.json; these
 # are treated as "not set" so improved defaults reach existing installs.
 RETIRED_VALUES = {
-    "segment_seconds": (1140,),
+    "segment_seconds": (1140, 300),
 }
 
 

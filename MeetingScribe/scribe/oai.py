@@ -159,11 +159,14 @@ def _b64_data_url(path) -> str:
         return "data:%s;base64,%s" % (mime, base64.b64encode(f.read()).decode())
 
 
-def transcribe_diarized(cfg, path, known_speakers=None) -> list:
+def transcribe_diarized(cfg, path, known_speakers=None,
+                        timeout=(15, 900)) -> list:
     """Diarized transcription. Returns [{speaker, text, start, end}].
 
     known_speakers: optional [(name, clip_path)] (max 4) to keep speaker labels
     consistent across multi-part recordings.
+    timeout: (connect, read) — whole-meeting single calls pass a longer read
+    timeout than the per-part default.
     """
     def call(with_refs):
         data = [
@@ -178,7 +181,7 @@ def transcribe_diarized(cfg, path, known_speakers=None) -> list:
         name, fh, mime = _file_tuple(path)
         try:
             return _post(cfg, "/audio/transcriptions", data=data,
-                         files={"file": (name, fh, mime)})
+                         files={"file": (name, fh, mime)}, timeout=timeout)
         finally:
             fh.close()
 
