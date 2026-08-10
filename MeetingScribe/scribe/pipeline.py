@@ -9,15 +9,17 @@ Meeting mode:
   API keeps speaker labels consistent within a request, so there is no
   cross-part stitching — the main source of wrongly merged speakers.
 
-  Longer recordings fall back to ~20-minute parts processed in parallel
-  ("anchor-then-fan-out"): every part must be told who the speakers are via
-  known-speaker reference clips, otherwise each part would label voices
-  independently. If stored voice profiles exist they are the references and
-  ALL parts run in parallel immediately. Otherwise part 1 runs alone first
-  ("anchor") to harvest one clip per speaker, then the remaining parts fan
-  out in parallel with those same references. A speaker who first appears
-  after the anchor part may occasionally split into two labels (renaming
-  both to the same name merges them) — the price of parallelism.
+  Longer recordings fall back to ``segment_seconds`` parts (default 10 min)
+  processed in parallel ("anchor-then-fan-out"): every part must be told who
+  the speakers are via known-speaker reference clips, otherwise each part
+  would label voices independently. If stored voice profiles exist they are
+  the references and ALL parts run in parallel immediately. Otherwise part 1
+  runs alone first ("anchor") to harvest one clip per speaker, then the
+  remaining parts fan out in parallel with those same references. A speaker
+  who first appears after the anchor part may split into two labels — the
+  price of parallelism. Renaming both to one name joins them, and "Fix
+  speakers" moves individual turns; reconcile.py refuses to fold such a
+  voice into an identified speaker on text evidence alone.
 
 Quick mode: all parts in parallel, no diarization.
 """
