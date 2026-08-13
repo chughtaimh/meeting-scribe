@@ -168,7 +168,7 @@ def _b64_data_url(path) -> str:
 
 
 def transcribe_diarized(cfg, path, known_speakers=None,
-                        timeout=(15, 300)) -> list:
+                        timeout=(15, 900)) -> list:
     """Diarized transcription. Returns [{speaker, text, start, end}].
 
     known_speakers: optional [(name, clip_path)] (max 4) to keep speaker labels
@@ -176,14 +176,20 @@ def transcribe_diarized(cfg, path, known_speakers=None,
     timeout: (connect, read) — whole-meeting single calls pass a longer read
     timeout than the per-part default.
 
-    The 300 s per-part default is a stall detector, not a latency budget: a
-    ``segment_seconds`` part (10 min of audio) normally returns in a few
-    minutes, so five minutes of silence means the connection is dead, not
-    slow. This matters on NAT64/cellular paths, where a path change mid-call
-    leaves the socket ESTABLISHED and mute — the old 900 s default turned that
-    into a 15-minute freeze per attempt (observed 2026-08-12: two meetings sat
-    on their anchor part for ~22 min, one timeout plus a retry that succeeded).
-    Retries are unaffected; each attempt just gives up sooner.
+    DO NOT lower the read timeout to "detect stalls". This endpoint does not
+    stream: OpenAI sends no bytes at all until the entire transcription is
+    finished, so the read timeout is the TOTAL server-side processing budget,
+    not an idle-connection detector. Set it below real transcription latency
+    and every part fails, on a healthy connection, after burning the full
+    timeout on all 3 attempts. That is exactly what a 300 s value did on
+    2026-08-13 — a 29-minute meeting failed outright, because a 600 s
+    (``segment_seconds``) part normally takes 5-10 minutes to come back.
+
+    900 s holds ~1.5-2x measured latency for a 600 s part, and matches the
+    ratio the whole-meeting single call uses (1800 s for up to 1380 s of
+    audio). A genuinely dead socket still costs a full timeout per attempt;
+    that is the price of an endpoint with no progress signal, and the retry
+    logging in ``_post`` is what makes it visible while it happens.
     """
     def call(with_refs):
         data = [
