@@ -42,4 +42,6 @@ w1*.txt
 
 # ── macOS noise ──
 .DS_Store
-~$blicis-Microsoft-Meeting-Prep.docx
+
+# Office lock files (created whenever a .docx/.xlsx here is open)
+~$*
