@@ -66,6 +66,54 @@ function speakerColor(label, order) {
   return SPEAKER_COLORS[i % SPEAKER_COLORS.length];
 }
 
+// Group speaker labels by their DISPLAY name. A person who was split across
+// several labels (over-segmentation) and renamed to one name shows as ONE chip
+// instead of several; each still-unidentified "Speaker X" label keeps its own
+// group. Named people come first, then the unidentified labels; first-seen
+// order is preserved within each. Nothing is dropped — every label lands in a
+// group and stays renameable.
+function legendGroups(speakers, order) {
+  const byDisplay = new Map(), groups = [];
+  for (const lab of order) {
+    const display = speakers[lab] || ("Speaker " + lab);
+    const named = !!display && !display.toLowerCase().startsWith("speaker");
+    const g = byDisplay.get(display);
+    if (g) { g.labels.push(lab); continue; }
+    const ng = { display, labels: [lab], named };
+    byDisplay.set(display, ng);
+    groups.push(ng);
+  }
+  const named = groups.filter(g => g.named);
+  const unnamed = groups.filter(g => !g.named);
+  return { named, unnamed };
+}
+
+// Honest header tally: distinct named people plus the count of still
+// unidentified voices — never the raw label count (which double-counts a
+// person spread across labels and inflates phantom over-segmentation).
+function speakerCountText(namedCount, unnamedCount) {
+  const s = n => (n === 1 ? "" : "s");
+  if (namedCount && unnamedCount)
+    return `${namedCount} speaker${s(namedCount)} + ${unnamedCount} unidentified`;
+  if (namedCount) return `${namedCount} speaker${s(namedCount)}`;
+  return `${unnamedCount} unidentified speaker${s(unnamedCount)}`;
+}
+
+// One legend chip per group. A merged group (>1 label) carries every underlying
+// label in data-labels so a rename updates them all at once, and gets a small
+// "split" badge to separate them again if the merge was wrong.
+function legendChipHtml(group, order) {
+  const labelsAttr = esc(JSON.stringify(group.labels));
+  const color = speakerColor(group.labels[0], order);
+  const merged = group.labels.length > 1;
+  return `<span class="chip" title="Click the name to rename">
+      <span class="swatch" style="background:${color}"></span>
+      <input data-labels="${labelsAttr}" value="${esc(group.display)}" spellcheck="false">
+      ${merged ? `<button class="splitbtn" type="button" data-labels="${labelsAttr}"
+        title="${group.labels.length} voice segments merged under one name — click to edit each separately">${group.labels.length}</button>` : ""}
+    </span>`;
+}
+
 const I = {
   mic: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="11" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><line x1="12" y1="17" x2="12" y2="21"/></svg>',
   users: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
@@ -79,6 +127,7 @@ const I = {
   folder: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>',
   doc: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>',
   upload: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>',
+  refresh: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>',
 };
 
 /* ---------------- modal ---------------- */
@@ -98,6 +147,8 @@ const Rec = {
   pauseStart: 0, uploadChain: Promise.resolve(), pendingUploads: 0,
   audioCtx: null, analyser: null, raf: 0, meterHistory: [], wakeLock: null,
   localChunks: null,  // quick mode keeps blobs in memory (nothing is stored server-side)
+  mixCtx: null, rawStreams: [],  // computer-audio capture: source streams behind the mixed stream
+  loopAnalyser: null, loopLoud: 0, loopWarned: false, loopTimer: 0,  // watches the loopback for broken routing
 
   elapsed() {
     if (!this.startTs) return 0;
@@ -113,13 +164,81 @@ const Rec = {
     return "";
   },
 
-  async start(mode, deviceId) {
+  // Computer audio (the other side of a Meet/Zoom call, any app) never reaches
+  // the microphone. The one-time setup routes everything the Mac plays into the
+  // BlackHole loopback driver (via the "Meeting Scribe Output" multi-output
+  // device), so capturing it is just a second getUserMedia input — no dialogs.
+  async captureComputerAudio() {
+    let devs = [];
+    try { devs = await navigator.mediaDevices.enumerateDevices(); } catch (e) {}
+    const loop = devs.find(d => d.kind === "audioinput" && /blackhole/i.test(d.label || ""));
+    if (!loop) {
+      const err = new Error("Computer-audio capture isn't set up on this Mac (the BlackHole loopback device wasn't found — see READ ME FIRST). Untick “Also capture computer audio” to record the microphone only.");
+      err.name = "NoLoopback";
+      throw err;
+    }
+    return navigator.mediaDevices.getUserMedia({
+      audio: { deviceId: { exact: loop.deviceId }, echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+      video: false,
+    });
+  },
+
+  async start(mode, deviceId, withComputerAudio) {
     if (this.active) throw new Error("Already recording");
     if (!navigator.mediaDevices || !window.MediaRecorder)
       throw new Error("This browser does not support audio recording.");
+
+    // Mic first: on the very first run this triggers the permission prompt,
+    // which also unlocks the device labels captureComputerAudio needs.
     const constraints = { audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: false };
     if (deviceId) constraints.audio.deviceId = { exact: deviceId };
-    this.mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+    const micStream = await navigator.mediaDevices.getUserMedia(constraints);
+
+    let loopStream = null;
+    if (withComputerAudio) {
+      try {
+        loopStream = await this.captureComputerAudio();
+      } catch (e) {
+        micStream.getTracks().forEach(t => t.stop());
+        throw e;
+      }
+    }
+
+    if (loopStream) {
+      // Mix mic + computer audio into a single stream for the recorder and meter.
+      this.mixCtx = new (window.AudioContext || window.webkitAudioContext)();
+      try { await this.mixCtx.resume(); } catch (e) {}
+      const dest = this.mixCtx.createMediaStreamDestination();
+      this.mixCtx.createMediaStreamSource(micStream).connect(dest);
+      const loopSrc = this.mixCtx.createMediaStreamSource(loopStream);
+      loopSrc.connect(dest);
+      // Watch the loopback on its own: silence there means the Mac's output was
+      // switched away from "Meeting Scribe Output" and call audio is being missed.
+      this.loopAnalyser = this.mixCtx.createAnalyser();
+      this.loopAnalyser.fftSize = 512;
+      loopSrc.connect(this.loopAnalyser);
+      this.loopLoud = Date.now(); this.loopWarned = false;
+      // setInterval, not the rAF meter loop: rAF pauses in background tabs,
+      // and a meeting recording tab usually is one.
+      this.loopTimer = setInterval(() => {
+        if (!this.active || this.paused || !this.loopAnalyser) return;
+        const ld = new Uint8Array(this.loopAnalyser.fftSize);
+        this.loopAnalyser.getByteTimeDomainData(ld);
+        let lsum = 0;
+        for (let i = 0; i < ld.length; i++) { const v = (ld[i] - 128) / 128; lsum += v * v; }
+        if (Math.sqrt(lsum / ld.length) > 0.005) {
+          this.loopLoud = Date.now(); this.loopWarned = false;
+        } else if (!this.loopWarned && Date.now() - this.loopLoud > 2 * 60 * 1000) {
+          this.loopWarned = true;
+          toast("No computer audio detected — check your Mac's sound output is set to “Meeting Scribe Output” (Control Center → Sound). Your microphone is still being recorded.", true);
+        }
+      }, 5000);
+      this.rawStreams = [micStream, loopStream];
+      this.mediaStream = dest.stream;
+    } else {
+      this.rawStreams = [micStream];
+      this.mediaStream = micStream;
+    }
     this.mode = mode;
     this.mime = this.pickMime();
 
@@ -130,10 +249,16 @@ const Rec = {
       this.id = null;
       this.localChunks = [];
     } else {
-      const { id } = await api("/api/recordings/start", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode }),
-      });
+      let id;
+      try {
+        ({ id } = await api("/api/recordings/start", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ mode }),
+        }));
+      } catch (e) {
+        this.releaseStreams();
+        throw e;
+      }
       this.id = id;
       this.localChunks = null;
     }
@@ -181,6 +306,15 @@ const Rec = {
     window.onbeforeunload = () => "Recording in progress — leaving will stop it.";
   },
 
+  releaseStreams() {
+    this.rawStreams.forEach(s => s.getTracks().forEach(t => t.stop()));
+    this.rawStreams = [];
+    this.mediaStream?.getTracks().forEach(t => t.stop());
+    this.mediaStream = null;
+    try { this.mixCtx?.close(); } catch (e) {}
+    this.mixCtx = null;
+  },
+
   pause() {
     if (!this.active || this.paused) return;
     this.recorder.pause(); this.paused = true; this.pauseStart = Date.now();
@@ -189,6 +323,7 @@ const Rec = {
     if (!this.active || !this.paused) return;
     this.recorder.resume(); this.paused = false;
     this.pausedTotal += Date.now() - this.pauseStart;
+    this.loopLoud = Date.now();  // don't warn instantly off a stale pre-pause timestamp
   },
 
   async stop(cancel) {
@@ -203,11 +338,12 @@ const Rec = {
     const stopped = new Promise((res) => { this.recorder.onstop = res; });
     try { this.recorder.state !== "inactive" && this.recorder.stop(); } catch (e) {}
     await Promise.race([stopped, new Promise(r => setTimeout(r, 4000))]);
-    this.mediaStream?.getTracks().forEach(t => t.stop());
+    this.releaseStreams();
     try { await this.wakeLock?.release(); } catch (e) {}
     try { this.audioCtx?.close(); } catch (e) {}
     cancelAnimationFrame(this.raf);
-    this.analyser = null; this.recorder = null; this.mediaStream = null;
+    clearInterval(this.loopTimer); this.loopTimer = 0;
+    this.analyser = null; this.loopAnalyser = null; this.recorder = null;
     this.id = null; this.startTs = 0; this.localChunks = null;
 
     if (cancel) return null;
@@ -328,7 +464,7 @@ async function viewHome() {
     </div>
     <div style="display:flex;justify-content:space-between;align-items:center">
       <h2>Recent</h2>
-      <button class="btn small" id="btn-import">${I.upload} Import audio file</button>
+      <button class="btn small" id="btn-import">${I.upload} Import audio or video file</button>
     </div>
     <div class="list" id="recent"></div>`;
 
@@ -376,7 +512,7 @@ function renderRecList(el, recs, emptyHtml) {
 function importAudio() {
   const input = document.createElement("input");
   input.type = "file";
-  input.accept = "audio/*,video/mp4,.m4a,.webm,.ogg,.opus,.flac";
+  input.accept = "audio/*,video/mp4,video/quicktime,.m4a,.webm,.ogg,.opus,.flac,.mp4,.mov";
   input.onchange = () => {
     const file = input.files[0];
     if (!file) return;
@@ -391,7 +527,7 @@ function importAudio() {
     m.querySelector("#imp-cancel").onclick = closeModal;
     const go = async (mode) => {
       closeModal();
-      toast("Uploading audio…");
+      toast(/\.(mp4|mov)$/i.test(file.name) ? "Uploading video…" : "Uploading audio…");
       const fd = new FormData();
       fd.append("file", file); fd.append("mode", mode);
       try {
@@ -422,17 +558,24 @@ async function viewRecord(mode) {
       <div class="recstate" id="recstate">Ready when you are</div>
       <canvas id="meter"></canvas>
       <div class="devrow"><select id="mic-select"><option value="">Default microphone</option></select></div>
+      ${isMeeting ? `<div class="devrow srcrow"><label class="srcopt"><input type="checkbox" id="tab-audio">
+        Also capture computer audio (Google&nbsp;Meet, Zoom, any app)</label></div>` : ""}
       <div class="recbtns" id="recbtns">
         <button class="btn rec big" id="btn-start">${I.mic} Start recording</button>
         <button class="btn big" id="btn-back">Back</button>
       </div>
-      ${isMeeting ? `<p class="muted small" style="margin-top:22px">Tip: for video calls, play the other side through your speakers so the microphone hears everyone.</p>` : ""}
+      ${isMeeting ? `<p class="muted small" style="margin-top:22px">Computer audio — the other side of your calls — is captured automatically, no dialogs. Just keep your Mac's sound output set to “Meeting Scribe Output”.</p>` : ""}
     </div>`;
 
   const $timer = document.getElementById("timer");
   const $state = document.getElementById("recstate");
   const $btns = document.getElementById("recbtns");
   const $mic = document.getElementById("mic-select");
+  const $tab = document.getElementById("tab-audio");
+  if ($tab) {
+    $tab.checked = localStorage.getItem("scribe.tabAudio") !== "0";  // default on
+    $tab.onchange = () => localStorage.setItem("scribe.tabAudio", $tab.checked ? "1" : "0");
+  }
 
   // populate device list (labels appear once permission has been granted)
   try {
@@ -471,7 +614,7 @@ async function viewRecord(mode) {
 
   const start = async () => {
     try {
-      await Rec.start(mode, $mic.value || undefined);
+      await Rec.start(mode, $mic.value || undefined, !!($tab && $tab.checked));
     } catch (e) {
       const msg = (e.name === "NotAllowedError" || e.name === "SecurityError")
         ? "Microphone access was blocked. Allow the microphone for this app in your browser, then try again."
@@ -479,7 +622,7 @@ async function viewRecord(mode) {
       toast(msg, true);
       return;
     }
-    document.querySelector(".devrow").style.display = "none";
+    document.querySelectorAll(".devrow").forEach(el => el.style.display = "none");
     $state.innerHTML = `<span class="dot"></span>Recording`;
     Rec.meterHistory = [];
     Rec.drawMeter(document.getElementById("meter"));
@@ -639,6 +782,7 @@ async function viewProcessing(recId) {
 /* ----- transcript ----- */
 async function viewTranscript(recId, params) {
   setNav("library");
+  document.body.classList.remove("fixmode");  // re-render always exits fix mode
   let rec;
   try { rec = await api("/api/recordings/" + recId); }
   catch (e) { $view.innerHTML = `<div class="empty">Recording not found.</div>`; return; }
@@ -649,14 +793,37 @@ async function viewTranscript(recId, params) {
   const isMeeting = rec.mode === "meeting";
   const turns = rec.turns || [];
   const hlStart = params.get("t");
+  const isVideo = /\.(mp4|mov)$/i.test(rec.audio_file || "");
 
-  const legend = isMeeting && order.length ? `
-    <div class="legend">${order.map(lab => `
-      <span class="chip" title="Click to rename">
-        <span class="swatch" style="background:${speakerColor(lab, order)}"></span>
-        <input data-label="${esc(lab)}" value="${esc(speakers[lab] || ("Speaker " + lab))}">
-      </span>`).join("")}
+  // AI notes. The "Regenerate notes" affordance is shown only for meetings
+  // that actually have a summary; the body lives in its own node so it can be
+  // refreshed in place after a regenerate (or an instant rename substitution).
+  const summaryCard = rec.summary ? `
+    <div class="card summary" id="summary-card">
+      <div class="sum-body">${mdLite(rec.summary)}</div>
+      ${isMeeting ? `<div class="sum-foot">
+        <button class="btn small" id="btn-regen"
+          title="Rewrite the AI notes from the current transcript and speaker names">
+          ${I.refresh} Regenerate notes</button>
+      </div>` : ""}
+    </div>` : "";
+
+  // Legend: dedupe a person split across labels into one chip, list named
+  // people before unidentified "Speaker X" labels, and fold a large unidentified
+  // group behind a one-click expander. Every label stays present and renameable.
+  const COLLAPSE_UNNAMED_AFTER = 4;
+  const lg = isMeeting ? legendGroups(speakers, order) : { named: [], unnamed: [] };
+  const collapseUnnamed = lg.unnamed.length > COLLAPSE_UNNAMED_AFTER;
+  const namedChips = lg.named.map(g => legendChipHtml(g, order)).join("");
+  const unnamedChips = lg.unnamed.map(g => legendChipHtml(g, order)).join("");
+  const legend = isMeeting && (lg.named.length || lg.unnamed.length) ? `
+    <div class="legend">
+      ${namedChips}${collapseUnnamed ? "" : unnamedChips}
       <span class="muted small" style="align-self:center">· click a name to edit</span>
+      ${collapseUnnamed ? `<details class="morespk">
+        <summary>Show ${lg.unnamed.length} unidentified speaker${lg.unnamed.length === 1 ? "" : "s"}</summary>
+        <div class="legend-more">${unnamedChips}</div>
+      </details>` : ""}
     </div>` : "";
 
   const turnsHtml = turns.map(t => {
@@ -664,7 +831,7 @@ async function viewTranscript(recId, params) {
     const name = lab ? (speakers[lab] || "Speaker " + lab) : "";
     const color = lab ? speakerColor(lab, order) : "var(--line)";
     const hl = hlStart !== null && Math.abs((t.start_s || 0) - parseFloat(hlStart)) < 0.5 ? " hl" : "";
-    return `<div class="turn${hl}" data-start="${t.start_s || 0}">
+    return `<div class="turn${hl}" data-start="${t.start_s || 0}" data-seq="${t.seq}" data-section="main">
       <div class="bar" style="background:${color}"></div>
       <div style="flex:1;min-width:0">
         ${lab ? `<div class="who" style="color:${color}">${esc(name)}
@@ -680,21 +847,35 @@ async function viewTranscript(recId, params) {
         <h1 contenteditable="true" id="rec-title" spellcheck="false">${esc(rec.title || "Untitled")}</h1>
       </div>
       <div class="meta">${esc(fmtDate(rec.created_at))} · ${esc(fmtClock(rec.duration_s))}
-        · ${isMeeting ? `Meeting · ${order.length} speaker${order.length === 1 ? "" : "s"}` : "Voice note"}</div>
+        · ${isMeeting ? `Meeting · ${esc(speakerCountText(lg.named.length, lg.unnamed.length))}` : "Voice note"}</div>
       <div class="actions">
         <button class="btn" id="btn-copy-all">${I.copy} Copy transcript</button>
         <a class="btn" href="/api/recordings/${esc(recId)}/file/md">${I.download} Markdown</a>
         <a class="btn" href="/api/recordings/${esc(recId)}/file/json">${I.doc} JSON</a>
+        ${isMeeting && turns.length ? `<button class="btn" id="btn-fixspk"
+          title="Move wrongly attributed lines to the right speaker">${I.users} Fix speakers</button>` : ""}
         <button class="btn danger" id="btn-del">${I.trash} Delete</button>
       </div>
     </div>
-    ${rec.summary ? `<div class="card summary">${mdLite(rec.summary)}</div>` : ""}
+    ${summaryCard}
     ${legend}
     <div class="turns">${turnsHtml || `<div class="empty">Transcript is empty.</div>`}</div>
     ${renderPostMeeting(rec, speakers, order)}
-    <div style="height:70px"></div>
-    <div class="audiobar"><div class="inner">
-      <audio id="player" controls preload="metadata" src="/api/recordings/${esc(recId)}/audio"></audio>
+    ${isMeeting && turns.length ? `
+    <div class="assignbar${isVideo ? " overvideo" : ""}" id="assignbar" hidden><div class="inner">
+      <span id="fix-count" class="muted small">0 selected</span>
+      <select id="fix-target">
+        ${order.map(l => `<option value="${esc(l)}">${esc(speakers[l] || "Speaker " + l)}</option>`).join("")}
+        <option value="__new__">New speaker…</option>
+      </select>
+      <button class="btn primary small" id="fix-apply" disabled>Assign</button>
+      <button class="btn small" id="fix-cancel">Done</button>
+    </div></div>` : ""}
+    <div style="height:${isVideo ? 240 : 70}px"></div>
+    <div class="audiobar${isVideo ? " videobar" : ""}"><div class="inner">
+      ${isVideo
+        ? `<video id="player" controls preload="metadata" playsinline src="/api/recordings/${esc(recId)}/audio"></video>`
+        : `<audio id="player" controls preload="metadata" src="/api/recordings/${esc(recId)}/audio"></audio>`}
     </div></div>`;
 
   const player = document.getElementById("player");
@@ -758,25 +939,161 @@ async function viewTranscript(recId, params) {
   $title.addEventListener("blur", saveTitle);
   $title.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $title.blur(); } });
 
-  // speaker renaming
+  // speaker renaming. Each input carries ALL labels that share its display name
+  // (data-labels), so editing a merged person renames every underlying label at
+  // once; collapsed/unidentified inputs stay in the DOM and are sent too.
   let renameTimer = null;
-  document.querySelectorAll(".legend input").forEach(inp => {
-    inp.addEventListener("change", () => {
-      clearTimeout(renameTimer);
-      renameTimer = setTimeout(async () => {
-        const mapping = {};
-        document.querySelectorAll(".legend input").forEach(i2 => { mapping[i2.dataset.label] = i2.value.trim(); });
-        try {
-          await api(`/api/recordings/${recId}/speakers`, {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ speakers: mapping }),
-          });
-          toast("Speakers updated");
-          viewTranscript(recId, params);   // re-render with new names
-        } catch (e) { toast(e.message, true); }
-      }, 250);
+  const labelsOf = (el) => { try { return JSON.parse(el.dataset.labels || "[]"); } catch (e) { return []; } };
+  const onRenameChange = () => {
+    clearTimeout(renameTimer);
+    renameTimer = setTimeout(async () => {
+      const mapping = {};
+      document.querySelectorAll(".legend input").forEach(i2 => {
+        const v = i2.value.trim();
+        labelsOf(i2).forEach(l => { mapping[l] = v; });
+      });
+      try {
+        await api(`/api/recordings/${recId}/speakers`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ speakers: mapping }),
+        });
+        toast("Speakers updated");
+        viewTranscript(recId, params);   // re-render with new names
+      } catch (e) { toast(e.message, true); }
+    }, 250);
+  };
+  const bindLegendInputs = () => {
+    document.querySelectorAll(".legend input").forEach(inp => {
+      if (inp.dataset.bound) return;
+      inp.dataset.bound = "1";
+      inp.addEventListener("change", onRenameChange);
+    });
+  };
+  bindLegendInputs();
+
+  // "Split" a merged person back into its individual labels for separate
+  // editing (undo a wrong merge). Purely expands the chip in place; renaming
+  // any of the split labels to a new name is what actually separates them.
+  document.querySelectorAll(".legend .splitbtn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const labs = labelsOf(btn);
+      const chip = btn.closest(".chip");
+      if (!chip || labs.length < 2) return;
+      const html = labs.map(l => legendChipHtml(
+        { display: speakers[l] || ("Speaker " + l), labels: [l], named: false }, order)).join("");
+      chip.insertAdjacentHTML("afterend", html);
+      chip.remove();
+      bindLegendInputs();
     });
   });
+
+  // "Fix speakers" mode: select wrongly attributed turns, assign them to an
+  // existing or brand-new speaker. The repair for a diarizer that joined two
+  // people under one label — renaming alone can't separate them.
+  const $fixspk = document.getElementById("btn-fixspk");
+  if ($fixspk) {
+    const bar = document.getElementById("assignbar");
+    const $count = document.getElementById("fix-count");
+    const $apply = document.getElementById("fix-apply");
+    let fixing = false;
+    const selected = () => [...document.querySelectorAll(".turn.sel")];
+    const updateCount = () => {
+      const n = selected().length;
+      $count.textContent = `${n} turn${n === 1 ? "" : "s"} selected`;
+      $apply.disabled = !n;
+    };
+    const setFixing = (on) => {
+      fixing = on;
+      document.body.classList.toggle("fixmode", on);
+      bar.hidden = !on;
+      $fixspk.classList.toggle("primary", on);
+      if (!on) selected().forEach(el => el.classList.remove("sel"));
+      updateCount();
+    };
+    $fixspk.onclick = () => setFixing(!fixing);
+    document.getElementById("fix-cancel").onclick = () => setFixing(false);
+    document.querySelectorAll(".turn[data-seq]").forEach(el => {
+      el.addEventListener("click", (e) => {
+        if (!fixing || e.target.closest(".ts")) return;  // timestamps still seek
+        el.classList.toggle("sel");
+        updateCount();
+      });
+    });
+    const reassign = async (body) => {
+      const els = selected();
+      const sections = new Set(els.map(el => el.dataset.section || "main"));
+      if (sections.size > 1) {
+        toast("Select turns from one section at a time", true);
+        return;
+      }
+      const seqs = els.map(el => parseInt(el.dataset.seq, 10));
+      try {
+        await api(`/api/recordings/${recId}/turns/reassign`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(Object.assign(
+            { seqs, section: [...sections][0] || "main" }, body)),
+        });
+        toast("Speakers updated");
+        if (rec.summary) sessionStorage.setItem("nudgeRegen:" + recId, "1");
+        viewTranscript(recId, params);   // re-render legend, colors, counts
+      } catch (e) { toast(e.message, true); }
+    };
+    $apply.onclick = () => {
+      if (!selected().length) return;
+      const choice = document.getElementById("fix-target").value;
+      if (choice !== "__new__") { reassign({ to_label: choice }); return; }
+      const m = showModal(`
+        <h3>New speaker</h3>
+        <p class="muted small">The selected turns move to a new speaker. Name them now, or leave blank to name later.</p>
+        <input type="text" id="ns-name" placeholder="Name (optional)" style="width:100%">
+        <div class="foot">
+          <button class="btn" id="ns-cancel">Cancel</button>
+          <button class="btn primary" id="ns-ok">Assign</button>
+        </div>`);
+      m.querySelector("#ns-cancel").onclick = closeModal;
+      const ok = () => {
+        const nm = m.querySelector("#ns-name").value.trim();
+        closeModal();
+        reassign({ new_speaker: true, name: nm });
+      };
+      m.querySelector("#ns-ok").onclick = ok;
+      m.querySelector("#ns-name").addEventListener("keydown",
+        (e) => { if (e.key === "Enter") ok(); });
+      m.querySelector("#ns-name").focus();
+    };
+  }
+
+  // regenerate AI notes (full re-summary with the current speaker names)
+  const $regen = document.getElementById("btn-regen");
+  if ($regen && sessionStorage.getItem("nudgeRegen:" + recId)) {
+    // A reassignment just changed attribution — the baked notes may credit
+    // the wrong person. Nudge, never auto-spend an LLM call.
+    sessionStorage.removeItem("nudgeRegen:" + recId);
+    $regen.classList.add("pulse");
+    setTimeout(() => $regen.classList.remove("pulse"), 6000);
+    toast("Notes may mention the old attribution — Regenerate notes?");
+  }
+  if ($regen) {
+    $regen.onclick = async () => {
+      const orig = $regen.innerHTML;
+      $regen.disabled = true;
+      $regen.innerHTML = `${I.refresh} Regenerating…`;
+      $regen.classList.add("spinning");
+      try {
+        const res = await api(`/api/recordings/${recId}/regenerate-notes`, { method: "POST" });
+        rec.summary = res.summary;
+        const body = document.querySelector("#summary-card .sum-body");
+        if (body) body.innerHTML = mdLite(res.summary);
+        toast("Notes regenerated");
+      } catch (e) {
+        toast(e.message, true);
+      } finally {
+        $regen.disabled = false;
+        $regen.innerHTML = orig;
+        $regen.classList.remove("spinning");
+      }
+    };
+  }
 }
 
 function renderPostMeeting(rec, speakers, order) {
@@ -787,7 +1104,7 @@ function renderPostMeeting(rec, speakers, order) {
     const lab = t.speaker || "";
     const name = lab ? (speakers[lab] || "Speaker " + lab) : "";
     const color = lab ? speakerColor(lab, order) : "var(--line)";
-    return `<div class="turn" data-start="${t.start_s || 0}">
+    return `<div class="turn" data-start="${t.start_s || 0}" data-seq="${t.seq}" data-section="post">
       <div class="bar" style="background:${color};opacity:.45"></div>
       <div style="flex:1;min-width:0">
         ${lab ? `<div class="who" style="color:${color};opacity:.75">${esc(name)}

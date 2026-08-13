@@ -62,6 +62,64 @@ def probe_duration(path) -> float:
     return 0.0
 
 
+def normalize(src, out_path) -> str:
+    """Convert to a single 16 kHz mono Opus (.ogg) file — no segmenting.
+
+    Recordings under the API's per-request duration cap (1400 s) go to the
+    diarizer in one request, which keeps speaker labels consistent for the
+    entire recording (no cross-part stitching). Longer recordings are
+    segmented from this file via segment_copy.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    proc = _run([
+        "-hide_banner", "-y", "-i", str(src),
+        "-vn", "-ac", "1", "-ar", "16000",
+        "-c:a", "libopus", "-b:a", "24k", "-application", "voip",
+        str(out_path),
+    ])
+    if proc.returncode != 0 or not out_path.exists():
+        tail = proc.stderr.decode("utf-8", "replace").strip().splitlines()[-3:]
+        raise RuntimeError("Audio conversion failed: %s" % " / ".join(tail))
+    return str(out_path)
+
+
+def segment_copy(src_ogg, out_dir, segment_seconds) -> list:
+    """Split an already-normalized .ogg into parts of <= segment_seconds.
+
+    Stream copy (no re-encode). Returns ordered part paths; raises on failure
+    (the caller may fall back to normalize_and_segment on the original source).
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for old in out_dir.glob("part_*.ogg"):
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    pattern = str(out_dir / "part_%03d.ogg")
+    proc = _run([
+        "-hide_banner", "-y", "-i", str(src_ogg),
+        "-c", "copy",
+        "-f", "segment", "-segment_time", str(int(segment_seconds)),
+        "-reset_timestamps", "1",
+        pattern,
+    ])
+    parts = sorted(out_dir.glob("part_*.ogg"))
+    if proc.returncode != 0 or not parts:
+        tail = proc.stderr.decode("utf-8", "replace").strip().splitlines()[-3:]
+        raise RuntimeError("Audio segmenting failed: %s" % " / ".join(tail))
+
+    # Same phantom-tail guard as normalize_and_segment.
+    if len(parts) > 1 and probe_duration(parts[-1]) < 0.3:
+        try:
+            parts[-1].unlink()
+        except OSError:
+            pass
+        parts = parts[:-1]
+    return [str(p) for p in parts]
+
+
 def normalize_and_segment(src, out_dir, segment_seconds) -> list:
     """Convert to 16 kHz mono Opus (.ogg) and split into parts of <= segment_seconds.
 
@@ -126,6 +184,40 @@ def extract_clip(src, start_s: float, dur_s: float, out_path) -> str:
     if proc.returncode != 0 or not out_path.exists():
         raise RuntimeError("Could not extract speaker reference clip")
     return str(out_path)
+
+
+def remux_to_mp4(src, dest) -> bool:
+    """Best-effort .mov -> .mp4 rewrap so the browser <video> element can play
+    it (Chrome refuses video/quicktime). Never raises; returns False when the
+    caller should keep the original file.
+
+    ffmpeg will happily stream-copy PCM audio (ipcm) or ProRes video into an
+    mp4 that no browser can decode, so "did ffmpeg succeed" is not the test —
+    the source codecs are. Video must already be browser-playable (copy only);
+    audio is copied when aac/mp3, else re-encoded to AAC (QuickTime PCM).
+    """
+    dest = Path(dest)
+    proc = _run(["-hide_banner", "-i", str(src)], timeout=60)
+    text = proc.stderr.decode("utf-8", "replace")
+    v = re.search(r": Video: (\w+)", text)
+    a = re.search(r": Audio: (\w+)", text)
+    if not v or v.group(1) not in ("h264", "hevc", "av1", "vp9"):
+        return False
+    args = ["-hide_banner", "-y", "-i", str(src), "-c:v", "copy"]
+    if v.group(1) == "hevc":
+        args += ["-tag:v", "hvc1"]  # Safari needs the hvc1 brand to play HEVC
+    if a and a.group(1) in ("aac", "mp3"):
+        args += ["-c:a", "copy"]
+    else:
+        args += ["-c:a", "aac", "-b:a", "160k"]
+    proc = _run(args + ["-movflags", "+faststart", str(dest)], timeout=1800)
+    if proc.returncode == 0 and dest.exists() and dest.stat().st_size > 0:
+        return True
+    try:
+        dest.unlink()
+    except OSError:
+        pass
+    return False
 
 
 def check() -> str:

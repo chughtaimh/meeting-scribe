@@ -1,19 +1,25 @@
 """Recording -> transcript pipeline.
 
 Meeting mode:
-  normalize audio -> split into ~5-minute parts -> diarized transcription of
-  the parts IN PARALLEL -> merge into speaker turns -> cleanup pass ->
-  AI title/summary -> save files -> index for keyword + vector search.
+  normalize audio -> diarized transcription -> merge into speaker turns ->
+  cleanup pass -> AI title/summary -> save files -> index for search.
 
-Speaker consistency across parallel parts ("anchor-then-fan-out"):
-  every part must be told who the speakers are via known-speaker reference
-  clips, otherwise each part would label voices independently. If stored
-  voice profiles exist they are the references and ALL parts run in parallel
-  immediately. Otherwise part 1 runs alone first ("anchor") to harvest one
-  clip per speaker, then the remaining parts fan out in parallel with those
-  same references. A speaker who first appears after the anchor part may
-  occasionally split into two labels (renaming both to the same name merges
-  them) — the price of parallelism, and rare in practice.
+  Recordings up to ``single_call_max_seconds`` (default 23 min — the API
+  rejects requests over 1400 s of audio) are diarized in ONE request: the
+  API keeps speaker labels consistent within a request, so there is no
+  cross-part stitching — the main source of wrongly merged speakers.
+
+  Longer recordings fall back to ``segment_seconds`` parts (default 10 min)
+  processed in parallel ("anchor-then-fan-out"): every part must be told who
+  the speakers are via known-speaker reference clips, otherwise each part
+  would label voices independently. If stored voice profiles exist they are
+  the references and ALL parts run in parallel immediately. Otherwise part 1
+  runs alone first ("anchor") to harvest one clip per speaker, then the
+  remaining parts fan out in parallel with those same references. A speaker
+  who first appears after the anchor part may split into two labels — the
+  price of parallelism. Renaming both to one name joins them, and "Fix
+  speakers" moves individual turns; reconcile.py refuses to fold such a
+  voice into an identified speaker on text evidence alone.
 
 Quick mode: all parts in parallel, no diarization.
 """
@@ -24,6 +30,10 @@ from datetime import datetime
 from pathlib import Path
 
 from . import audio, cleanup, config, db, oai, profiles, reconcile, store
+
+# Single-call ceiling: stay under the API's 25 MB upload cap with margin for
+# multipart framing and base64-encoded reference clips.
+SINGLE_CALL_MAX_BYTES = 23 * 1024 * 1024
 
 
 def _fallback_title(mode: str, created: datetime, text: str) -> str:
@@ -100,9 +110,13 @@ class _SpeakerTracker:
                                             + max(0.0, s["end"] - s["start"]))
 
     def map_anchor(self, segments):
-        """Anchor (or single-part) mapping: fresh letters, first-seen order."""
+        """Anchor (or single-call) mapping: fresh letters, first-seen order.
+        A label matching a stored-profile name (the API matched a reference
+        clip) passes through unchanged."""
         mapping = {}
         for s in segments:
+            if s["speaker"] in self.named:
+                continue
             if s["speaker"] not in mapping:
                 mapping[s["speaker"]] = self._new_letter()
             s["speaker"] = mapping[s["speaker"]]
@@ -164,18 +178,45 @@ def process(rec_id: str, job):
                                "Check the microphone permission for your browser "
                                "in System Settings → Privacy & Security, then try again.")
 
-        parts = audio.normalize_and_segment(src, tmp_dir,
-                                            int(cfg.get("segment_seconds") or 1140))
-        n = len(parts)
-        part_durs = [audio.probe_duration(p) for p in parts]
+        # Normalize the whole recording to one file first; segmenting (only
+        # needed past the single-call ceiling) stream-copies from it.
+        full = tmp_dir / "full.ogg"
+        try:
+            audio.normalize(src, full)
+        except RuntimeError as e:
+            config.log("whole-file normalize failed, will segment from "
+                       "source: %s" % e)
+            full = None
 
         # Browser recordings often lack header duration — use, in order:
-        # header probe, the sum of converted parts, the browser-reported length.
-        duration = audio.probe_duration(src)
+        # the normalized file, the source header, the browser-reported length.
+        duration = audio.probe_duration(full) if full else 0.0
         if duration < 0.4:
-            duration = sum(part_durs)
+            duration = audio.probe_duration(src)
         if duration < 0.4:
             duration = float(rec.get("duration_s") or 0)
+
+        single_call = (
+            mode == "meeting" and full is not None and duration >= 0.4
+            and duration <= float(cfg.get("single_call_max_seconds") or 1380)
+            and full.stat().st_size <= SINGLE_CALL_MAX_BYTES)
+        seg_secs = int(cfg.get("segment_seconds") or 1200)
+        if single_call:
+            parts = [str(full)]
+        elif full is not None:
+            try:
+                parts = audio.segment_copy(full, tmp_dir, seg_secs)
+            except RuntimeError as e:
+                config.log("segment stream-copy failed, re-encoding: %s" % e)
+                parts = audio.normalize_and_segment(src, tmp_dir, seg_secs)
+        else:
+            parts = audio.normalize_and_segment(src, tmp_dir, seg_secs)
+        n = len(parts)
+        part_durs = ([duration] if single_call
+                     else [audio.probe_duration(p) for p in parts])
+
+        if duration < 0.4:
+            duration = sum(part_durs)
         if duration < 0.4:
             raise RuntimeError("No readable audio in this recording. Check the "
                                "microphone permission for your browser and try again.")
@@ -200,7 +241,16 @@ def process(rec_id: str, job):
                 detail=("Transcribing %d parts…" % n) if n > 1 else "Transcribing…",
                 pct=8)
 
-        if mode == "meeting":
+        if mode == "meeting" and single_call:
+            # Whole meeting in one request: the API keeps speaker labels
+            # consistent for the entire file, so nothing needs stitching and
+            # the reconcile pass has no provisional labels to merge.
+            segments = oai.transcribe_diarized(cfg, parts[0],
+                                               stored_profiles or None,
+                                               timeout=(15, 1800))
+            tracker.map_anchor(segments)
+            segments.sort(key=lambda s: (s["start"], s["end"]))
+        elif mode == "meeting":
             results = {}            # part index -> raw segments (offsets applied)
             ref_names = {}          # name sent with each reference clip -> label
             refs = None
@@ -373,8 +423,12 @@ def process(rec_id: str, job):
         job.set(stage="saving", detail="Saving transcript…", pct=84)
         folder = store.make_folder(created, title)
         ext = src.suffix or ".webm"
-        audio_name = "audio" + ext
-        shutil.move(str(src), str(folder / audio_name))
+        if ext == ".mov" and audio.remux_to_mp4(src, folder / "audio.mp4"):
+            audio_name = "audio.mp4"
+            src.unlink(missing_ok=True)
+        else:
+            audio_name = "audio" + ext
+            shutil.move(str(src), str(folder / audio_name))
 
         meta = {
             "id": rec_id, "title": title, "mode": mode,

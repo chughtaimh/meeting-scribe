@@ -5,6 +5,21 @@ APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$APP_DIR"
 GUI="${1:-cli}"
 
+# Where writable state lives. Inside an .app bundle the code directory is
+# read-only (Gatekeeper translocates unsigned apps to a read-only mount), so
+# the venv, config, database, and logs all go to Application Support instead.
+if [[ "$APP_DIR" == *"/Contents/Resources/"* || "${2:-}" == "--bundled" ]]; then
+  SUPPORT_DIR="$HOME/Library/Application Support/MeetingScribe"
+  VENV="$SUPPORT_DIR/.venv"
+  DATA_DIR="$SUPPORT_DIR/data"
+  export SCRIBE_DATA_DIR="$DATA_DIR"
+else
+  VENV="$APP_DIR/.venv"
+  DATA_DIR="$APP_DIR/data"
+fi
+LOG_FILE="$DATA_DIR/scribe.log"
+mkdir -p "$DATA_DIR"
+
 say()    { echo "● $1"; }
 notify() { if [ "$GUI" = "gui" ]; then osascript -e "display notification \"$1\" with title \"Meeting Scribe\"" >/dev/null 2>&1 || true; fi; }
 fail() {
@@ -25,7 +40,6 @@ if ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,9) els
 fi
 
 # ---- 2. Private environment + components ----
-VENV="$APP_DIR/.venv"
 REQ_SUM="$(/usr/bin/openssl md5 -r requirements.txt 2>/dev/null | cut -d' ' -f1)"
 MARK="$VENV/.deps-${REQ_SUM:-x}"
 
@@ -33,7 +47,7 @@ if [ ! -x "$VENV/bin/python" ]; then
   say "First-time setup — preparing Meeting Scribe (takes a minute or two)…"
   notify "First-time setup — takes a minute or two"
   python3 -m venv "$VENV" 2>/dev/null || { rm -rf "$VENV"; python3 -m venv "$VENV"; } \
-    || fail "Could not create the app's Python environment. See MeetingScribe/data/scribe.log."
+    || fail "Could not create the app's Python environment. See $LOG_FILE."
 fi
 if [ ! -f "$MARK" ]; then
   say "Downloading components (Flask, audio tools)…"
@@ -47,19 +61,18 @@ if [ ! -f "$MARK" ]; then
 fi
 
 # ---- 3. Start (keeps running in the background) ----
-mkdir -p "$APP_DIR/data"
 say "Starting Meeting Scribe…"
 notify "Starting Meeting Scribe…"
-nohup "$VENV/bin/python" "$APP_DIR/run.py" >> "$APP_DIR/data/scribe.log" 2>&1 &
+nohup "$VENV/bin/python" "$APP_DIR/run.py" >> "$LOG_FILE" 2>&1 &
 
 # Wait briefly and sanity-check
 STARTED=""
 for i in $(seq 1 20); do
   sleep 0.5
-  if tail -n 5 "$APP_DIR/data/scribe.log" 2>/dev/null | grep -q "Meeting Scribe"; then STARTED="yes"; break; fi
+  if tail -n 5 "$LOG_FILE" 2>/dev/null | grep -q "Meeting Scribe"; then STARTED="yes"; break; fi
 done
-if tail -n 30 "$APP_DIR/data/scribe.log" 2>/dev/null | grep -q "Traceback"; then
-  fail "Meeting Scribe hit an error while starting. Open MeetingScribe/data/scribe.log and send it to whoever set this up."
+if tail -n 30 "$LOG_FILE" 2>/dev/null | grep -q "Traceback"; then
+  fail "Meeting Scribe hit an error while starting. Open $LOG_FILE and send it to whoever set this up."
 fi
 
 say "Meeting Scribe is running — your browser will open in a moment."

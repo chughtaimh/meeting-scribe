@@ -306,7 +306,7 @@ def rec_import():
         return _err("Unsupported audio format: %s" % ext)
     rec_id = uuid.uuid4().hex[:12]
     config.ensure_dirs()
-    dest = config.INPROGRESS_DIR / (rec_id + (".m4a" if ext in (".mp4", ".mov", ".aac") else ext))
+    dest = config.INPROGRESS_DIR / (rec_id + (".m4a" if ext == ".aac" else ext))
     f.save(str(dest))
     db.upsert_recording({
         "id": rec_id, "title": "Processing…", "mode": mode,
@@ -395,8 +395,80 @@ def rec_speakers(rec_id):
     mapping = body.get("speakers") or {}
     if not isinstance(mapping, dict):
         return _err("speakers must be an object")
-    speakers = store.rename_speakers(rec_id, mapping)
-    return jsonify({"ok": True, "speakers": speakers})
+    res = store.rename_speakers(rec_id, mapping)
+    # ``summary`` carries the instant token-substituted notes so the UI can
+    # refresh the summary card in place without a full reload.
+    return jsonify({"ok": True, "speakers": res["speakers"],
+                    "summary": res["summary"]})
+
+
+@app.route("/api/recordings/<rec_id>/turns/reassign", methods=["POST"])
+def rec_reassign_turns(rec_id):
+    """Move selected turns to another (or a brand-new) speaker — the manual
+    fix when the diarizer joined two people under one label."""
+    body = request.get_json(force=True, silent=True) or {}
+    seqs = body.get("seqs")
+    if not isinstance(seqs, list) or not seqs:
+        return _err("seqs must be a non-empty list")
+    section = (body.get("section")
+               if body.get("section") in ("main", "post") else "main")
+    new_speaker = bool(body.get("new_speaker"))
+    to_label = None if new_speaker else body.get("to_label")
+    if not new_speaker and not to_label:
+        return _err("Provide to_label or new_speaker")
+    try:
+        res = store.reassign_turns(rec_id, seqs, to_label=to_label,
+                                   new_name=body.get("name"), section=section)
+    except KeyError:
+        return _err("Not found", 404)
+    except (ValueError, TypeError) as e:
+        return _err(str(e))
+    search.invalidate_cache()
+    return jsonify({"ok": True, **res})
+
+
+@app.route("/api/recordings/<rec_id>/regenerate-notes", methods=["POST"])
+def rec_regenerate_notes(rec_id):
+    """Rewrite the AI meeting notes from the CURRENT transcript + speaker names.
+    Only the SUMMARY is persisted — the title is left as-is (it is independently
+    user-editable). A fresh title is suggested in the response for the user to
+    optionally apply, but never auto-applied here. Returns the new summary so
+    the front end can refresh the summary card in place."""
+    rec = db.get_recording(rec_id)
+    if not rec:
+        return _err("Not found", 404)
+    if rec.get("status") != "done" or not rec.get("folder"):
+        return _err("This recording isn't ready yet.")
+    if rec.get("mode") != "meeting":
+        return _err("Notes are only generated for meetings.")
+    try:
+        data = store.read_transcript(rec["folder"])
+    except Exception as e:
+        return _err("Could not read the transcript: %s" % e)
+    turns = data.get("turns") or []
+    speakers = data.get("speakers") or {}
+    if not turns:
+        return _err("This recording has no transcript to summarize.")
+
+    # Speaker-attributed text using the CURRENT display names (post-rename), so
+    # the regenerated notes reflect the corrected speakers. Mirrors the format
+    # the pipeline feeds the summarizer.
+    full_text = "\n".join(
+        ("%s: %s" % (speakers.get(t["speaker"], t["speaker"]), t["text"])
+         if t.get("speaker") else t["text"])
+        for t in turns)
+
+    cfg = config.load()
+    # title_and_summary never raises; an empty summary means the call failed
+    # (e.g. missing/invalid key) — do NOT clobber the existing notes with "".
+    ts = oai.title_and_summary(cfg, full_text, "meeting", list(speakers.values()))
+    summary = (ts.get("summary") or "").strip()
+    if not summary:
+        return _err("Couldn't regenerate the notes — check your OpenAI API key "
+                    "in Settings and try again.")
+    store.update_summary(rec_id, summary)
+    return jsonify({"ok": True, "summary": summary,
+                    "suggested_title": (ts.get("title") or "").strip()})
 
 
 @app.route("/api/recordings/<rec_id>/audio")

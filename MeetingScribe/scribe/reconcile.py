@@ -7,10 +7,14 @@ guardrails. It addresses three real failure modes:
 1. FRAGMENTATION — a voice with no reference clip (5th+ participant, or
    anyone absent from the anchor part) gets a per-part provisional label like
    "P3:A". The same human may hold several provisional labels across parts.
-   The model merges provisionals using conversational evidence (addressed by
-   name and replying, continuing a thread, self-references). Merging is only
-   allowed INTO a named/anchored speaker or another provisional — two
-   identified speakers can never be merged.
+   The model merges provisionals with each other using conversational
+   evidence (addressed by name and replying, continuing a thread,
+   self-references). Merging a provisional INTO an identified speaker is
+   refused in code: identified labels come from an acoustic voice-reference
+   match, and letting text-only evidence overrule that is how distinct people
+   used to be fused under one name. An extra unidentified speaker is the safe
+   failure — renaming two labels to the same name joins them, and "Fix
+   speakers" moves individual turns.
 
 2. MISATTRIBUTION — the diarizer occasionally matches an unprofiled voice to
    the wrong reference clip (e.g. a guest labeled as a regular). The model may
@@ -52,12 +56,13 @@ _RULES = """TRANSCRIPT of a recorded meeting is below. Speaker labels:
 
 Do three tasks:
 
-1. "merges": unify provisional labels that clearly belong to one person, or to
-   an identified speaker. Evidence that counts: they are addressed by name and
-   the reply comes from that label; they continue the same sentence or thread
-   across a boundary; they refer to their own earlier statements; identical
-   distinctive role. NEVER merge two IDENTIFIED speakers. When unsure, leave
-   the label alone.
+1. "merges": unify PROVISIONAL labels that clearly belong to one person.
+   Evidence that counts: they continue the same sentence or thread across a
+   boundary; they refer to their own earlier statements; they are addressed by
+   the same name; identical distinctive role. Both "from" and "to" must be
+   PROVISIONAL labels — never merge into an IDENTIFIED speaker, and never
+   merge two IDENTIFIED speakers. An unidentified voice staying separate is
+   the safe outcome. When unsure, leave the label alone.
 
 2. "reassigned": individual turns whose label contradicts the conversation —
    e.g. the turn answers a question addressed by name to someone else, or the
@@ -72,7 +77,7 @@ Do three tasks:
    runs to the final turn, use null.
 
 Return JSON exactly:
-{"merges": [{"from": "<provisional>", "to": "<label>"}],
+{"merges": [{"from": "<provisional>", "to": "<provisional>"}],
  "reassigned": [{"seq": <n>, "to": "<label>", "evidence": "<short quote>"}],
  "meeting_end_s": <number or null>}
 
@@ -99,13 +104,24 @@ def _render(turns, speakers):
 
 
 def _resolve_merges(raw_merges, named, provisional):
-    """Validated, transitively-resolved mapping {provisional -> final label}."""
+    """Validated, transitively-resolved mapping {provisional -> final label}.
+
+    Both ends must be provisional. Merging an unmatched voice INTO an
+    identified speaker is refused: identified labels are anchored by actual
+    voice-reference clips, and a text-only model overruling that acoustic
+    match is how several distinct people used to end up fused under one name.
+    Leaving the voice as its own speaker is recoverable — the user renames two
+    labels to the same name to join them (the legend then shows one person).
+    """
     direct = {}
     for m in raw_merges or []:
         src = str(m.get("from") or "")
         dst = str(m.get("to") or "")
-        if (src in provisional and src != dst
-                and (dst in named or dst in provisional)):
+        if src in provisional and dst in named:
+            config.log("reconcile: refused merge of %s into identified %s "
+                       "(text-only evidence)" % (src, dst))
+            continue
+        if src in provisional and src != dst and dst in provisional:
             direct[src] = dst
     resolved = {}
     for src in direct:

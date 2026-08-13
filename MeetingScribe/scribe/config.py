@@ -1,4 +1,6 @@
-"""Configuration management. Stored locally in MeetingScribe/data/config.json."""
+"""Configuration management. Stored locally in <data dir>/config.json —
+MeetingScribe/data/ for in-place installs, or
+~/Library/Application Support/MeetingScribe/data/ when run from the .app bundle."""
 
 import json
 import os
@@ -7,7 +9,23 @@ import threading
 from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent.parent          # .../MeetingScribe
-DATA_DIR = APP_DIR / "data"
+
+
+def _resolve_data_dir() -> Path:
+    # Precedence: SCRIBE_DATA_DIR env (set by launch.sh when running from an
+    # .app bundle, whose Resources tree is read-only under app translocation),
+    # then an existing in-place data/ dir (dev checkouts and installs that
+    # predate the bundle), then the standard macOS per-user location.
+    env = os.environ.get("SCRIBE_DATA_DIR")
+    if env:
+        return Path(env).expanduser()
+    legacy = APP_DIR / "data"
+    if legacy.is_dir():
+        return legacy
+    return Path.home() / "Library" / "Application Support" / "MeetingScribe" / "data"
+
+
+DATA_DIR = _resolve_data_dir()
 INPROGRESS_DIR = DATA_DIR / "inprogress"
 TMP_DIR = DATA_DIR / "tmp"
 LOG_FILE = DATA_DIR / "scribe.log"
@@ -17,8 +35,13 @@ _lock = threading.Lock()
 
 
 def _default_transcripts_dir() -> str:
-    # Default: a "Transcripts" folder next to the MeetingScribe app folder.
-    return str(APP_DIR.parent / "Transcripts")
+    if DATA_DIR == APP_DIR / "data":
+        # In-place install: a "Transcripts" folder next to the MeetingScribe
+        # app folder, as before.
+        return str(APP_DIR.parent / "Transcripts")
+    # Bundled install: the app folder may be read-only, so keep transcripts
+    # somewhere the user can find them.
+    return str(Path.home() / "Documents" / "Meeting Scribe Transcripts")
 
 
 DEFAULTS = {
@@ -63,11 +86,22 @@ DEFAULTS = {
     "self_profile_name": "",        # chosen profile name; "" = not set
     "self_profile_enabled": False,  # master toggle for auto-identifying "me"
     "port": 5723,
-    # Per-request audio segment length sent to OpenAI (seconds). Small parts
-    # transcribe fast individually and are processed IN PARALLEL; 5 minutes
-    # balances per-request latency against diarization context per part.
-    # (Hard API ceiling is ~1400s per chunk.)
-    "segment_seconds": 300,
+    # Meetings up to this duration are diarized in ONE request — the API
+    # keeps speaker labels consistent within a request, so no cross-part
+    # stitching (the main source of wrongly merged speakers). The API rejects
+    # requests over 1400 s of audio regardless of chunking_strategy (verified
+    # 2026-08-10: "audio duration ... longer than 1400 seconds which is the
+    # maximum for this model"), so this caps just under. Longer meetings fall
+    # back to the parallel per-part path below.
+    "single_call_max_seconds": 1380,
+    # Fallback-path segment length (seconds), used only past the single-call
+    # cap. Transcription time scales with part length (a 20-minute part
+    # measured >5 min on its own), and the anchor part runs alone before the
+    # rest fan out, so oversized parts cost wall-clock twice over. 10 minutes
+    # keeps all 4 workers busy while giving the anchor enough coverage to
+    # sample most speakers. Voices missed by the anchor now stay separate
+    # rather than being folded into someone else (see scribe/reconcile.py).
+    "segment_seconds": 600,
     # Max simultaneous OpenAI calls, shared across all recordings being
     # processed (keeps rate-limit pressure bounded).
     "transcribe_concurrency": 4,
@@ -85,7 +119,7 @@ def ensure_dirs():
 # the full config (defaults included), freezing them in config.json; these
 # are treated as "not set" so improved defaults reach existing installs.
 RETIRED_VALUES = {
-    "segment_seconds": (1140,),
+    "segment_seconds": (1140, 300),
 }
 
 

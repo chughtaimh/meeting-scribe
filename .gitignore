@@ -31,5 +31,15 @@ venv/
 __pycache__/
 *.pyc
 
+# ── Personal assistant files / scratch — never ship ──
+CLAUDE.md
+.claude/
+w1*.txt
+
+# ── Distribution build output ──
+*.dmg
+/dist/
+
 # ── macOS noise ──
 .DS_Store
+~$blicis-Microsoft-Meeting-Prep.docx
