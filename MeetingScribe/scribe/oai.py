@@ -92,6 +92,12 @@ def _post(cfg, path, *, data=None, files=None, json_body=None, timeout=(15, 900)
                                   files=files, json=json_body, timeout=timeout)
         except requests.RequestException as e:
             last = OAIError("Network error talking to OpenAI: %s" % e)
+            # Always logged. A stalled connection burns the whole read timeout
+            # before landing here, so a silent retry leaves a job frozen on its
+            # last progress step for many minutes with nothing in the log to
+            # explain it — the transcript looks stuck when it is merely retrying.
+            config.log("POST %s attempt %d/%d failed: %s"
+                       % (path, attempt + 1, retries, e))
             time.sleep(1.5 * (attempt + 1))
             continue
         if r.status_code == 200:
@@ -100,6 +106,8 @@ def _post(cfg, path, *, data=None, files=None, json_body=None, timeout=(15, 900)
                         body=r.text)
         # retry only transient statuses
         if r.status_code in (429, 500, 502, 503, 504) and attempt < retries - 1:
+            config.log("POST %s attempt %d/%d got HTTP %d; retrying"
+                       % (path, attempt + 1, retries, r.status_code))
             time.sleep(2.0 * (attempt + 1))
             continue
         raise last
@@ -160,13 +168,22 @@ def _b64_data_url(path) -> str:
 
 
 def transcribe_diarized(cfg, path, known_speakers=None,
-                        timeout=(15, 900)) -> list:
+                        timeout=(15, 300)) -> list:
     """Diarized transcription. Returns [{speaker, text, start, end}].
 
     known_speakers: optional [(name, clip_path)] (max 4) to keep speaker labels
     consistent across multi-part recordings.
     timeout: (connect, read) — whole-meeting single calls pass a longer read
     timeout than the per-part default.
+
+    The 300 s per-part default is a stall detector, not a latency budget: a
+    ``segment_seconds`` part (10 min of audio) normally returns in a few
+    minutes, so five minutes of silence means the connection is dead, not
+    slow. This matters on NAT64/cellular paths, where a path change mid-call
+    leaves the socket ESTABLISHED and mute — the old 900 s default turned that
+    into a 15-minute freeze per attempt (observed 2026-08-12: two meetings sat
+    on their anchor part for ~22 min, one timeout plus a retry that succeeded).
+    Retries are unaffected; each attempt just gives up sooner.
     """
     def call(with_refs):
         data = [
