@@ -45,3 +45,5 @@ w1*.txt
 
 # Office lock files (created whenever a .docx/.xlsx here is open)
 ~$*
+.agents/skills/verify/SKILL.md
+AGENTS.md

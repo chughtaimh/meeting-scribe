@@ -13,10 +13,27 @@ import json
 import os
 import re
 import shutil
+import threading
 from datetime import datetime
 from pathlib import Path
 
 from . import config, db
+
+# Title of a recording that is still processing and hasn't been named by the
+# user. Any other title on an unfinished row is the user's own choice, and the
+# pipeline keeps it instead of the AI-generated one.
+PENDING_TITLE = "Processing…"
+
+# Serializes title edits against the pipeline's save step, so a rename that
+# lands while a recording is finishing is either adopted by the save or
+# applied to the saved files — never lost or overwritten.
+title_lock = threading.Lock()
+
+
+def user_title(rec: dict) -> str:
+    """The name the user gave a not-yet-finished recording ('' if none)."""
+    t = (rec.get("title") or "").strip()
+    return "" if t == PENDING_TITLE else t
 
 
 def safe_name(s: str, fallback="Recording") -> str:
@@ -377,17 +394,29 @@ def reassign_turns(rec_id: str, seqs, to_label=None, new_name=None,
 
 
 def update_title(rec_id: str, title: str) -> str:
-    rec = db.get_recording(rec_id)
-    if not rec:
-        raise KeyError("Recording not found")
-    title = safe_name(title, fallback=rec.get("title") or "Recording")
-    folder = Path(rec["folder"])
-    data = read_transcript(folder)
-    data["title"] = title
-    write_transcript_files(folder, {k: v for k, v in data.items() if k != "turns"},
-                           data.get("turns") or [])
-    db.update_recording(rec_id, title=title)
-    return title
+    """Rename a recording; returns the name now in effect.
+
+    Before processing finishes (still running, or failed and awaiting Retry)
+    there are no files yet: the name is kept on the db row and the pipeline
+    adopts it when it saves. A blank name there hands naming back to the
+    pipeline and returns ''. Once finished, the transcript files are renamed
+    too and a blank name keeps the current title."""
+    with title_lock:
+        rec = db.get_recording(rec_id)
+        if not rec:
+            raise KeyError("Recording not found")
+        if rec.get("status") != "done" or not rec.get("folder"):
+            title = safe_name(title, fallback="")
+            db.update_recording(rec_id, title=title or PENDING_TITLE)
+            return title
+        title = safe_name(title, fallback=rec.get("title") or "Recording")
+        folder = Path(rec["folder"])
+        data = read_transcript(folder)
+        data["title"] = title
+        write_transcript_files(folder, {k: v for k, v in data.items() if k != "turns"},
+                               data.get("turns") or [])
+        db.update_recording(rec_id, title=title)
+        return title
 
 
 def update_summary(rec_id: str, summary: str) -> str:

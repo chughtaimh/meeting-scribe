@@ -162,6 +162,10 @@ input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-so
   font-size: 14px; cursor: pointer; user-select: none;
 }
 .srcopt input { accent-color: var(--accent); width: 16px; height: 16px; }
+.namerow { margin: 16px auto 0; max-width: 420px; }
+.namerow input { text-align: center; font-weight: 600; }
+.namerow input:disabled { color: var(--ink-2); background: var(--bg); }
+.namehint { font-size: 12.5px; color: var(--ink-3); margin-top: 6px; min-height: 18px; }
 
 /* ---------- processing ---------- */
 .progress { height: 8px; background: var(--bg); border-radius: 999px; overflow: hidden; margin: 18px 0 10px; }
