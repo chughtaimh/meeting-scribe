@@ -3,6 +3,7 @@
 Meeting mode:
   normalize audio -> diarized transcription -> merge into speaker turns ->
   cleanup pass -> AI title/summary -> save files -> index for search.
+  A name the user typed while recording or processing replaces the AI title.
 
   Recordings up to ``single_call_max_seconds`` (default 23 min — the API
   rejects requests over 1400 s of audio) are diarized in ONE request: the
@@ -419,32 +420,36 @@ def process(rec_id: str, job):
         if not title:
             title = _fallback_title(mode, created, full_text)
 
-        # Save files to the transcripts folder
+        # Save files to the transcripts folder. Under title_lock: a rename made
+        # while recording or processing is read fresh here and beats the AI
+        # title; one arriving mid-save waits and then renames the saved files.
         job.set(stage="saving", detail="Saving transcript…", pct=84)
-        folder = store.make_folder(created, title)
-        ext = src.suffix or ".webm"
-        if ext == ".mov" and audio.remux_to_mp4(src, folder / "audio.mp4"):
-            audio_name = "audio.mp4"
-            src.unlink(missing_ok=True)
-        else:
-            audio_name = "audio" + ext
-            shutil.move(str(src), str(folder / audio_name))
+        with store.title_lock:
+            title = store.user_title(db.get_recording(rec_id) or {}) or title
+            folder = store.make_folder(created, title)
+            ext = src.suffix or ".webm"
+            if ext == ".mov" and audio.remux_to_mp4(src, folder / "audio.mp4"):
+                audio_name = "audio.mp4"
+                src.unlink(missing_ok=True)
+            else:
+                audio_name = "audio" + ext
+                shutil.move(str(src), str(folder / audio_name))
 
-        meta = {
-            "id": rec_id, "title": title, "mode": mode,
-            "created_at": rec["created_at"], "duration_s": duration,
-            "audio_file": audio_name, "summary": summary,
-            "speakers": speakers, "folder": str(folder), "status": "done",
-            "app": "Meeting Scribe",
-        }
-        if cleanup_meta is not None:
-            meta["cleanup"] = cleanup_meta
-        if raw_turns is not None:
-            meta["raw_turns"] = raw_turns
-        if post_meta is not None:
-            meta["post_meeting"] = post_meta
-        store.write_transcript_files(folder, meta, turns)
-        store.index_recording(meta, turns)
+            meta = {
+                "id": rec_id, "title": title, "mode": mode,
+                "created_at": rec["created_at"], "duration_s": duration,
+                "audio_file": audio_name, "summary": summary,
+                "speakers": speakers, "folder": str(folder), "status": "done",
+                "app": "Meeting Scribe",
+            }
+            if cleanup_meta is not None:
+                meta["cleanup"] = cleanup_meta
+            if raw_turns is not None:
+                meta["raw_turns"] = raw_turns
+            if post_meta is not None:
+                meta["post_meeting"] = post_meta
+            store.write_transcript_files(folder, meta, turns)
+            store.index_recording(meta, turns)
 
         # Embeddings for semantic search (best-effort)
         job.set(stage="indexing", detail="Indexing for search…", pct=90)

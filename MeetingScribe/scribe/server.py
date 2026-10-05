@@ -198,7 +198,8 @@ def rec_finish(rec_id):
 
     db.upsert_recording({
         "id": rec_id,
-        "title": "Processing…",
+        # A name typed in the recorder; the pipeline keeps it over the AI's.
+        "title": store.safe_name(body.get("title"), fallback="") or store.PENDING_TITLE,
         "mode": mode,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "duration_s": float(body.get("duration") or 0),
@@ -309,7 +310,7 @@ def rec_import():
     dest = config.INPROGRESS_DIR / (rec_id + (".m4a" if ext == ".aac" else ext))
     f.save(str(dest))
     db.upsert_recording({
-        "id": rec_id, "title": "Processing…", "mode": mode,
+        "id": rec_id, "title": store.PENDING_TITLE, "mode": mode,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "duration_s": 0, "folder": "", "audio_file": str(dest),
         "status": "processing", "error": "", "summary": "", "speakers_json": "{}",
@@ -357,7 +358,12 @@ def rec_detail(rec_id):
 def rec_patch(rec_id):
     body = request.get_json(force=True, silent=True) or {}
     if "title" in body:
-        title = store.update_title(rec_id, body["title"])
+        # Works at any stage: while processing the name is held for the
+        # pipeline (blank = name it automatically), afterwards the files change.
+        try:
+            title = store.update_title(rec_id, body["title"])
+        except KeyError:
+            return _err("Not found", 404)
         return jsonify({"ok": True, "title": title})
     return _err("Nothing to update")
 
@@ -507,7 +513,9 @@ def job_status(rec_id):
     rec = db.get_recording(rec_id)
     return jsonify({"job": j, "status": (rec or {}).get("status"),
                     "error": (rec or {}).get("error"),
-                    "title": (rec or {}).get("title")})
+                    "title": (rec or {}).get("title"),
+                    "user_title": store.user_title(rec or {}),
+                    "mode": (rec or {}).get("mode")})
 
 
 # ---------- search & maintenance ----------

@@ -147,6 +147,7 @@ const Rec = {
   pauseStart: 0, uploadChain: Promise.resolve(), pendingUploads: 0,
   audioCtx: null, analyser: null, raf: 0, meterHistory: [], wakeLock: null,
   localChunks: null,  // quick mode keeps blobs in memory (nothing is stored server-side)
+  title: "",  // meeting name typed in the recorder; sent with finish
   mixCtx: null, rawStreams: [],  // computer-audio capture: source streams behind the mixed stream
   loopAnalyser: null, loopLoud: 0, loopWarned: false, loopTimer: 0,  // watches the loopback for broken routing
 
@@ -331,6 +332,7 @@ const Rec = {
     const id = this.id, mode = this.mode, mime = this.mime;
     const duration = this.elapsed();
     const localChunks = this.localChunks;
+    const title = (this.title || "").trim();
     this.active = false;
     window.onbeforeunload = null;
 
@@ -362,7 +364,7 @@ const Rec = {
     await this.uploadChain;             // drain pending chunk uploads
     await api(`/api/recordings/${id}/finish`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mode, mime, duration }),
+      body: JSON.stringify({ mode, mime, duration, title }),
     });
     return id;
   },
@@ -554,6 +556,9 @@ async function viewRecord(mode) {
   $view.innerHTML = `
     <div class="card recwrap">
       <span class="modechip">${isMeeting ? I.users + " Meeting Recording — speakers will be detected" : I.mic + " Quick Transcribe — fast text, not saved"}</span>
+      ${isMeeting ? `<div class="namerow"><input type="text" id="rec-name" maxlength="80"
+        placeholder="Name this meeting (optional)" aria-label="Meeting name"
+        title="Leave blank to have it named automatically" spellcheck="false" autocomplete="off"></div>` : ""}
       <div class="timer" id="timer">0:00</div>
       <div class="recstate" id="recstate">Ready when you are</div>
       <canvas id="meter"></canvas>
@@ -575,6 +580,15 @@ async function viewRecord(mode) {
   if ($tab) {
     $tab.checked = localStorage.getItem("scribe.tabAudio") !== "0";  // default on
     $tab.onchange = () => localStorage.setItem("scribe.tabAudio", $tab.checked ? "1" : "0");
+  }
+  // Meeting name: editable before and during recording. It lives on Rec, so
+  // leaving the recorder mid-meeting and coming back keeps what was typed.
+  const $name = document.getElementById("rec-name");
+  if (!Rec.active) Rec.title = "";
+  if ($name) {
+    $name.value = Rec.title;
+    $name.oninput = () => { Rec.title = $name.value; };
+    $name.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); $name.blur(); } };
   }
 
   // populate device list (labels appear once permission has been granted)
@@ -648,10 +662,15 @@ async function viewRecord(mode) {
       return;
     }
     $state.textContent = "Saving audio…";
+    if ($name) $name.disabled = true;   // the name is sent now; keep it final
     try {
       const id = await Rec.stop(false);
       if (id) location.hash = "#/processing/" + id;
-    } catch (e) { toast(e.message, true); $state.textContent = "Something went wrong"; renderButtons(); }
+    } catch (e) {
+      toast(e.message, true); $state.textContent = "Something went wrong";
+      if ($name) $name.disabled = false;
+      renderButtons();
+    }
   };
 
   // Render the finished quick transcript inline with copy + record-again.
@@ -686,9 +705,18 @@ async function viewRecord(mode) {
 /* ----- processing ----- */
 async function viewProcessing(recId) {
   setNav("");
+  let info0 = null;
+  try { info0 = await api("/api/jobs/" + recId); } catch (e) {}
+  const noun = info0 && info0.mode === "quick" ? "recording" : "meeting";
   $view.innerHTML = `
     <div class="card recwrap" id="proccard">
       <div class="modechip">⏳ Working on it</div>
+      <div class="namerow">
+        <input type="text" id="proc-name" maxlength="80" value="${esc((info0 && info0.user_title) || "")}"
+          placeholder="Name this ${noun} (optional)" aria-label="${noun === "meeting" ? "Meeting" : "Recording"} name"
+          spellcheck="false" autocomplete="off">
+        <div class="namehint" id="proc-name-hint">Leave blank to have it named automatically.</div>
+      </div>
       <h1 id="proc-stage" style="margin:18px 0 4px;font-size:22px">Queued…</h1>
       <div class="muted" id="proc-detail"></div>
       <div class="progress"><div id="proc-bar" style="width:3%"></div></div>
@@ -702,6 +730,41 @@ async function viewProcessing(recId) {
     transcribing: "Transcribing…", summarizing: "Summarizing…",
     saving: "Saving…", indexing: "Indexing for search…", done: "Done", error: "Failed" };
 
+  // Name while it processes: autosaved (debounced, and on blur/Enter), and
+  // flushed before leaving for the transcript so nothing typed is lost. Saves
+  // run in order so an older value can never land after a newer one.
+  const $name = document.getElementById("proc-name");
+  const $nameHint = document.getElementById("proc-name-hint");
+  const hintFor = (v) => v ? "✓ Saved — this name will be kept."
+                           : "Leave blank to have it named automatically.";
+  let savedName = $name.value.trim(), nameTimer = null, nameChain = Promise.resolve();
+  $nameHint.textContent = hintFor(savedName);
+  const saveName = () => {
+    clearTimeout(nameTimer);
+    const v = $name.value.trim();
+    if (v === savedName) return nameChain;
+    savedName = v;
+    $nameHint.textContent = "Saving…";
+    nameChain = nameChain.then(() => api("/api/recordings/" + recId, {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: v }),
+    })).then((res) => {
+      if ($name.value.trim() !== v) return;   // newer edit pending; it reports
+      if (document.activeElement !== $name) { $name.value = res.title; savedName = res.title; }
+      $nameHint.textContent = hintFor(res.title);
+    }).catch((e) => {
+      savedName = null;   // force the next save to retry
+      $nameHint.textContent = "Couldn't save the name — " + e.message;
+    });
+    return nameChain;
+  };
+  $name.addEventListener("input", () => {
+    clearTimeout(nameTimer);
+    nameTimer = setTimeout(saveName, 700);
+  });
+  $name.addEventListener("blur", saveName);
+  $name.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $name.blur(); } });
+
   let stopped = false;
   const poll = async () => {
     if (stopped || !location.hash.includes(recId)) return;
@@ -710,7 +773,12 @@ async function viewProcessing(recId) {
     const job = info && info.job;
     const status = info && info.status;
 
-    if (status === "done") { stopped = true; return showDone(); }
+    if (status === "done") {
+      stopped = true;
+      $name.disabled = true;   // finished: flush the last edit, then move on
+      await saveName();
+      return showDone();
+    }
     if ((job && job.error) || status === "error") {
       stopped = true;
       const msg = (job && job.error) || (info && info.error) || "Unknown error";
@@ -725,6 +793,7 @@ async function viewProcessing(recId) {
          </div>`);
       document.getElementById("btn-retry").onclick = async () => {
         try {
+          await saveName();   // the retry run must see the latest name
           await api("/api/recordings/" + recId + "/retry", { method: "POST" });
           viewProcessing(recId);
         } catch (e) { toast(e.message, true); }
